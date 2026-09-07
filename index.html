@@ -955,12 +955,6 @@ function initApp(){
       ctx.drawImage(lastResult.heatmapBitmaps[item], tl[0], tl[1], br[0] - tl[0], br[1] - tl[1]);
     }
 
-    // boundary
-    if (els.layerBoundary.checked) {
-      ctx.strokeStyle = "#7fb7ff"; ctx.lineWidth = 1.5;
-      drawGeometry(lastResult.boundaryGeometry, projector);
-    }
-
     // contours
     if (els.layerContour.checked && lastResult.contours[item]) {
       ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 1;
@@ -994,6 +988,12 @@ function initApp(){
           ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(ex, ey); ctx.stroke();
         }
       }
+    }
+
+    // boundary（ヒートマップ等の塗りつぶしに隠れないよう、常に最前面に描画する）
+    if (els.layerBoundary.checked) {
+      ctx.strokeStyle = "#7fb7ff"; ctx.lineWidth = 1.5;
+      drawGeometry(lastResult.boundaryGeometry, projector);
     }
   }
 
