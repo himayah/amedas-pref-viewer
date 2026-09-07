@@ -339,6 +339,16 @@ function clusterPolygons(geometry, gapDeg){
   return clusters;
 }
 
+// 地域（クラスタ）内のアメダス観測点名から、地域選択肢用のラベルを作る。
+// 実在の地名データベースを持たないため、代わりにその地域に含まれる観測点名
+// （多くは島名・地区名と一致する。例:「父島」「大島」）をそのまま利用する。
+// 観測点が3件以上ある場合は代表2件＋残数のみ表示し、選択肢が長くなりすぎないようにする。
+function regionLabelFromStationNames(names){
+  if (!names || names.length === 0) return "離島";
+  if (names.length <= 2) return names.join("・");
+  return names.slice(0, 2).join("・") + "他" + (names.length - 2) + "地点";
+}
+
 // 点と線分の最短距離の2乗
 function distPointToSegmentSq(px, py, ax, ay, bx, by){
   var dx = bx - ax, dy = by - ay;
@@ -575,6 +585,7 @@ var AmedasApp = {
   polygonBounds: polygonBounds,
   bboxGapDistance: bboxGapDistance,
   clusterPolygons: clusterPolygons,
+  regionLabelFromStationNames: regionLabelFromStationNames,
   distPointToSegmentSq: distPointToSegmentSq,
   pointNearGeometry: pointNearGeometry,
   makeProjector: makeProjector,
@@ -716,13 +727,17 @@ function initApp(){
 
   // 都道府県ジオメトリを本土・離島などの地域に分割し、実際にアメダス観測点を含む
   // クラスタのみを候補地域として返す（観測点数の多い順、先頭が最大＝本土扱い）。
+  // 本土以外のラベルは、その地域に含まれるアメダス観測点名（多くは島名と一致）から生成する。
   function buildRegions(amedasTable, prefGeometry){
     var clusters = AmedasApp.clusterPolygons(prefGeometry, REGION_GAP_DEG);
     var regions = [];
     for (var i = 0; i < clusters.length; i++) {
       var stations = selectStationsInGeometry(amedasTable, clusters[i].geometry, 0);
       if (stations.length === 0) continue;
-      regions.push({ geometry: clusters[i].geometry, stationCount: stations.length, label: "" });
+      regions.push({
+        geometry: clusters[i].geometry, stationCount: stations.length,
+        stationNames: stations.map(function(s){ return s.name; }), label: ""
+      });
     }
     regions.sort(function(a, b){ return b.stationCount - a.stationCount; });
     if (regions.length <= 1) {
@@ -730,7 +745,7 @@ function initApp(){
     } else {
       regions[0].label = "本土";
       for (var r = 1; r < regions.length; r++) {
-        regions[r].label = regions.length === 2 ? "離島" : ("離島" + r);
+        regions[r].label = AmedasApp.regionLabelFromStationNames(regions[r].stationNames);
       }
     }
     return regions;

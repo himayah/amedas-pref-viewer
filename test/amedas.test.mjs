@@ -241,6 +241,13 @@ test("clusterPolygons: Polygon型ジオメトリは常に単一クラスタに�
   assert.equal(clusters[0].geometry.type, "Polygon");
 });
 
+test("regionLabelFromStationNames: 観測点名から地域選択肢用のラベルを生成する", () => {
+  assert.equal(A.regionLabelFromStationNames([]), "離島");
+  assert.equal(A.regionLabelFromStationNames(["父島"]), "父島");
+  assert.equal(A.regionLabelFromStationNames(["父島", "母島"]), "父島・母島");
+  assert.equal(A.regionLabelFromStationNames(["大島", "新島", "神津島"]), "大島・新島他1地点");
+});
+
 test("distPointToSegmentSq: 点-線分間の最短距離の2乗を計算する", () => {
   // 水平線分(0,0)-(10,0)の真上(5,3)にある点 -> 距離3
   assert.ok(Math.abs(A.distPointToSegmentSq(5, 3, 0, 0, 10, 0) - 9) < 1e-9);
