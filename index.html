@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>アメダス都道府県統計ビューア</title>
+<style>
+  :root{
+    --bg:#0f172a; --panel:#16213a; --panel2:#1c2b4a; --border:#2b3d61;
+    --text:#e6edf7; --muted:#93a4c3; --accent:#3fa9ff; --accent2:#ff7a59;
+    --ok:#3fd6a0; --warn:#ffcf5c; --err:#ff6b6b;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font-family:"Segoe UI","Hiragino Kaku Gothic ProN",Meiryo,sans-serif;}
+  header{padding:10px 16px;border-bottom:1px solid var(--border);
+    display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
+  header h1{font-size:16px;margin:0;font-weight:600;}
+  header p{margin:0;font-size:12px;color:var(--muted);}
+  .app{display:flex;height:calc(100% - 46px);min-height:600px;}
+  .controls{width:320px;min-width:280px;overflow-y:auto;border-right:1px solid var(--border);
+    padding:12px;background:var(--panel);}
+  .controls fieldset{border:1px solid var(--border);border-radius:8px;margin:0 0 12px;padding:8px 10px;}
+  .controls legend{font-size:11px;color:var(--muted);padding:0 4px;}
+  .controls label{display:block;font-size:13px;margin:4px 0;}
+  select, button{width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--border);
+    background:var(--panel2);color:var(--text);font-size:13px;}
+  .radioRow, .checkRow{display:flex;align-items:center;gap:6px;font-size:13px;margin:4px 0;}
+  .radioRow input, .checkRow input{width:auto;}
+  button#loadBtn{background:var(--accent);color:#04101f;font-weight:600;border:none;cursor:pointer;margin-top:4px;}
+  button#loadBtn:disabled{opacity:.55;cursor:progress;}
+  button.secondary{background:var(--panel2);color:var(--text);cursor:pointer;margin-top:6px;}
+  #statusNote{font-size:12px;padding:8px;border-radius:6px;margin:8px 0;display:none;}
+  #statusNote.info{display:block;background:#123049;border:1px solid #1f4f78;color:#bfe4ff;}
+  #statusNote.error{display:block;background:#3a1620;border:1px solid #6c2431;color:#ffb3bd;}
+  #summaryPanel{font-size:12.5px;line-height:1.6;}
+  #summaryPanel table{width:100%;border-collapse:collapse;}
+  #summaryPanel td{padding:2px 0;border-bottom:1px dashed var(--border);}
+  #summaryPanel td.k{color:var(--muted);width:58%;}
+  #logPanel{height:150px;overflow-y:auto;font-size:11px;font-family:Consolas,monospace;
+    background:#0b1424;border:1px solid var(--border);border-radius:6px;padding:6px;color:var(--muted);}
+  #logPanel div.err{color:var(--err);}
+  #logPanel div.warn{color:var(--warn);}
+  #logPanel div.ok{color:var(--ok);}
+  .mapWrap{flex:1;position:relative;background:#0a1220;}
+  #mapCanvas{width:100%;height:100%;display:block;cursor:grab;}
+  #mapCanvas.dragging{cursor:grabbing;}
+  #tooltip{position:absolute;pointer-events:none;background:rgba(10,18,32,.92);
+    border:1px solid var(--border);border-radius:6px;padding:6px 8px;font-size:12px;
+    color:var(--text);display:none;white-space:nowrap;}
+  #legend{position:absolute;left:14px;bottom:14px;background:rgba(10,18,32,.85);
+    border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:11px;color:var(--muted);}
+  #legendBar{width:180px;height:10px;border-radius:4px;margin:4px 0;}
+  #legendLabels{display:flex;justify-content:space-between;}
+  .hint{font-size:11px;color:var(--muted);margin-top:2px;}
+</style>
+</head>
+<body>
+<header>
+  <h1>アメダス都道府県統計ビューア</h1>
+  <p>気象庁アメダス公開データ（過去24時間・実測）／降水量・気温・湿度・風の統計を地図に可視化</p>
+</header>
+<div class="app">
+  <aside class="controls">
+    <fieldset>
+      <legend>対象</legend>
+      <label for="prefSelect">都道府県</label>
+      <select id="prefSelect"></select>
+
+      <label style="margin-top:8px;">統計区間</label>
+      <div class="radioRow"><input type="radio" name="interval" id="int24h" value="24h" checked><label for="int24h">過去24時間（実測）</label></div>
+      <div class="radioRow"><input type="radio" name="interval" id="int1m" value="1m"><label for="int1m">過去1か月</label></div>
+      <div class="radioRow"><input type="radio" name="interval" id="int1y" value="1y"><label for="int1y">過去1年</label></div>
+
+      <button id="loadBtn" type="button">取得・描画</button>
+      <div class="hint">気象庁の公開APIは実測データの保持期間が短いため、過去1か月・1年は実測データを取得できません（詳細はREADME参照）。</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>描画項目・レイヤー</legend>
+      <label for="itemSelect">描画項目</label>
+      <select id="itemSelect">
+        <option value="precipitation">降水量（累計, mm）</option>
+        <option value="temperature">気温（平均, ℃）</option>
+        <option value="humidity">湿度（平均, %）</option>
+        <option value="windSpeed">風速（合成ベクトル平均, m/s）</option>
+        <option value="windDirection">風向（合成ベクトル平均）</option>
+      </select>
+      <div class="checkRow"><input type="checkbox" id="layerHeatmap" checked><label for="layerHeatmap">ヒートマップ</label></div>
+      <div class="checkRow"><input type="checkbox" id="layerContour" checked><label for="layerContour">等高線</label></div>
+      <div class="checkRow"><input type="checkbox" id="layerPoints" checked><label for="layerPoints">観測点</label></div>
+      <div class="checkRow"><input type="checkbox" id="layerBoundary" checked><label for="layerBoundary">都道府県境界</label></div>
+      <button id="resetViewBtn" type="button" class="secondary">表示リセット（拡大縮小/移動）</button>
+    </fieldset>
+
+    <div id="statusNote"></div>
+
+    <fieldset>
+      <legend>統計サマリー</legend>
+      <div id="summaryPanel">未取得です。「取得・描画」を押してください。</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>ログ</legend>
+      <div id="logPanel"></div>
+    </fieldset>
+  </aside>
+
+  <main class="mapWrap">
+    <canvas id="mapCanvas"></canvas>
+    <div id="tooltip"></div>
+    <div id="legend" style="display:none;">
+      <div id="legendTitle">凡例</div>
+      <div id="legendBar"></div>
+      <div id="legendLabels"><span id="legendMin"></span><span id="legendMax"></span></div>
+    </div>
+  </main>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* =========================================================================
+ * 1. 定数
+ * ========================================================================= */
+var PREFS = [
+  "北海道","青森県","岩手県","宮城県","秋田県","山形県","福島県","茨城県","栃木県","群馬県",
+  "埼玉県","千葉県","東京都","神奈川県","新潟県","富山県","石川県","福井県","山梨県","長野県",
+  "岐阜県","静岡県","愛知県","三重県","滋賀県","京都府","大阪府","兵庫県","奈良県","和歌山県",
+  "鳥取県","島根県","岡山県","広島県","山口県","徳島県","香川県","愛媛県","高知県","福岡県",
+  "佐賀県","長崎県","熊本県","大分県","宮崎県","鹿児島県","沖縄県"
+];
+
+var AMEDAS_TABLE_URL = "https://www.jma.go.jp/bosai/amedas/const/amedastable.json";
+var LATEST_TIME_URL  = "https://www.jma.go.jp/bosai/amedas/data/latest_time.txt";
+var GEOJSON_URL       = "https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson";
+function mapUrl(ts){ return "https://www.jma.go.jp/bosai/amedas/data/map/" + ts + ".json"; }
+
+var ITEM_META = {
+  precipitation: { label:"降水量", unit:"mm" },
+  temperature:   { label:"気温",   unit:"℃" },
+  humidity:      { label:"湿度",   unit:"%" },
+  windSpeed:     { label:"風速",   unit:"m/s" },
+  windDirection: { label:"風向",   unit:"" }
+};
+
+/* =========================================================================
+ * 2. 純粋関数群（テスト対象）: window.AmedasApp としてエクスポート
+ * ========================================================================= */
+
+function dmsToDecimal(dm){
+  return dm[0] + dm[1] / 60;
+}
+
+function windDirCodeToDeg(code){
+  if (code === null || code === undefined || code === 0) return null;
+  var deg = (code % 16) * 22.5;
+  return deg;
+}
+
+var COMPASS16 = ["北","北北東","北東","東北東","東","東南東","南東","南南東",
+                  "南","南南西","南西","西南西","西","西北西","北西","北北西"];
+function degToCompass16(deg){
+  if (deg === null || deg === undefined || !isFinite(deg)) return "―";
+  var idx = Math.round(deg / 22.5) % 16;
+  if (idx < 0) idx += 16;
+  return COMPASS16[idx];
+}
+
+function meanOf(arr){
+  var s = 0, n = 0;
+  for (var i = 0; i < arr.length; i++) {
+    var v = arr[i];
+    if (typeof v === "number" && isFinite(v)) { s += v; n++; }
+  }
+  return n === 0 ? null : s / n;
+}
+
+function sumOf(arr){
+  var s = 0, n = 0;
+  for (var i = 0; i < arr.length; i++) {
+    var v = arr[i];
+    if (typeof v === "number" && isFinite(v)) { s += v; n++; }
+  }
+  return n === 0 ? null : s;
+}
+
+function rmsOf(arr){
+  var s = 0, n = 0;
+  for (var i = 0; i < arr.length; i++) {
+    var v = arr[i];
+    if (typeof v === "number" && isFinite(v)) { s += v * v; n++; }
+  }
+  return n === 0 ? null : Math.sqrt(s / n);
+}
+
+// list: [{speed, dirDeg}], meteorological "from" convention
+function vectorWindAverage(list){
+  var su = 0, sv = 0, n = 0;
+  for (var i = 0; i < list.length; i++) {
+    var speed = list[i].speed, dirDeg = list[i].dirDeg;
+    if (typeof speed !== "number" || !isFinite(speed)) continue;
+    if (typeof dirDeg !== "number" || !isFinite(dirDeg)) continue;
+    var rad = dirDeg * Math.PI / 180;
+    su += -speed * Math.sin(rad);
+    sv += -speed * Math.cos(rad);
+    n++;
+  }
+  if (n === 0) return { speed: null, dirDeg: null };
+  var u = su / n, v = sv / n;
+  var spd = Math.sqrt(u * u + v * v);
+  var dir = Math.atan2(-u, -v) * 180 / Math.PI;
+  if (dir < 0) dir += 360;
+  return { speed: spd, dirDeg: dir };
+}
+
+function pointInRing(lon, lat, ring){
+  var inside = false;
+  for (var i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    var xi = ring[i][0], yi = ring[i][1];
+    var xj = ring[j][0], yj = ring[j][1];
+    var intersect = ((yi > lat) !== (yj > lat)) &&
+      (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function pointInPolygonCoords(lon, lat, polygon){
+  if (!polygon.length) return false;
+  if (!pointInRing(lon, lat, polygon[0])) return false;
+  for (var k = 1; k < polygon.length; k++) {
+    if (pointInRing(lon, lat, polygon[k])) return false;
+  }
+  return true;
+}
+
+function pointInGeometry(lon, lat, geometry){
+  if (!geometry) return false;
+  if (geometry.type === "Polygon") {
+    return pointInPolygonCoords(lon, lat, geometry.coordinates);
+  }
+  if (geometry.type === "MultiPolygon") {
+    var polys = geometry.coordinates;
+    for (var i = 0; i < polys.length; i++) {
+      if (pointInPolygonCoords(lon, lat, polys[i])) return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+function geometryBounds(geometry){
+  var lonMin = Infinity, lonMax = -Infinity, latMin = Infinity, latMax = -Infinity;
+  function visitRing(ring){
+    for (var i = 0; i < ring.length; i++) {
+      var lon = ring[i][0], lat = ring[i][1];
+      if (lon < lonMin) lonMin = lon;
+      if (lon > lonMax) lonMax = lon;
+      if (lat < latMin) latMin = lat;
+      if (lat > latMax) latMax = lat;
+    }
+  }
+  function visitPolygon(poly){ for (var i = 0; i < poly.length; i++) visitRing(poly[i]); }
+  if (geometry.type === "Polygon") {
+    visitPolygon(geometry.coordinates);
+  } else if (geometry.type === "MultiPolygon") {
+    var polys = geometry.coordinates;
+    for (var i = 0; i < polys.length; i++) visitPolygon(polys[i]);
+  }
+  return { lonMin: lonMin, lonMax: lonMax, latMin: latMin, latMax: latMax };
+}
+
+function makeProjector(bounds, width, height, padding){
+  var latMid = (bounds.latMin + bounds.latMax) / 2;
+  var cos = Math.cos(latMid * Math.PI / 180);
+  var lonSpan = Math.max((bounds.lonMax - bounds.lonMin) * cos, 1e-9);
+  var latSpan = Math.max(bounds.latMax - bounds.latMin, 1e-9);
+  var availW = Math.max(width - 2 * padding, 1);
+  var availH = Math.max(height - 2 * padding, 1);
+  var scale = Math.min(availW / lonSpan, availH / latSpan);
+  var drawW = lonSpan * scale, drawH = latSpan * scale;
+  var offX = padding + (availW - drawW) / 2;
+  var offY = padding + (availH - drawH) / 2;
+  return {
+    scale: scale, cos: cos, bounds: bounds,
+    toXY: function(lon, lat){
+      return [
+        (lon - bounds.lonMin) * cos * scale + offX,
+        (bounds.latMax - lat) * scale + offY
+      ];
+    }
+  };
+}
+
+// points: [{lon,lat,value}]
+function idwGrid(points, bounds, cols, rows, power){
+  power = power || 2;
+  var values = new Array(cols * rows);
+  var lonStep = (bounds.lonMax - bounds.lonMin) / (cols - 1 || 1);
+  var latStep = (bounds.latMax - bounds.latMin) / (rows - 1 || 1);
+  var valid = [];
+  for (var i = 0; i < points.length; i++) {
+    if (typeof points[i].value === "number" && isFinite(points[i].value)) valid.push(points[i]);
+  }
+  for (var r = 0; r < rows; r++) {
+    var lat = bounds.latMax - r * latStep;
+    for (var c = 0; c < cols; c++) {
+      var lon = bounds.lonMin + c * lonStep;
+      var idx = r * cols + c;
+      if (valid.length === 0) { values[idx] = NaN; continue; }
+      var wsum = 0, vsum = 0, exact = null;
+      for (var k = 0; k < valid.length; k++) {
+        var dx = valid[k].lon - lon, dy = valid[k].lat - lat;
+        var d2 = dx * dx + dy * dy;
+        if (d2 < 1e-12) { exact = valid[k].value; break; }
+        var w = 1 / Math.pow(d2, power / 2);
+        wsum += w; vsum += w * valid[k].value;
+      }
+      values[idx] = exact !== null ? exact : vsum / wsum;
+    }
+  }
+  return { values: values, cols: cols, rows: rows, bounds: bounds };
+}
+
+function maskGridByGeometry(grid, geometry){
+  var out = grid.values.slice();
+  var lonStep = (grid.bounds.lonMax - grid.bounds.lonMin) / (grid.cols - 1 || 1);
+  var latStep = (grid.bounds.latMax - grid.bounds.latMin) / (grid.rows - 1 || 1);
+  for (var r = 0; r < grid.rows; r++) {
+    var lat = grid.bounds.latMax - r * latStep;
+    for (var c = 0; c < grid.cols; c++) {
+      var lon = grid.bounds.lonMin + c * lonStep;
+      if (!pointInGeometry(lon, lat, geometry)) out[r * grid.cols + c] = NaN;
+    }
+  }
+  return { values: out, cols: grid.cols, rows: grid.rows, bounds: grid.bounds };
+}
+
+function gridCellLonLat(grid, c, r){
+  var lonStep = (grid.bounds.lonMax - grid.bounds.lonMin) / (grid.cols - 1 || 1);
+  var latStep = (grid.bounds.latMax - grid.bounds.latMin) / (grid.rows - 1 || 1);
+  return [grid.bounds.lonMin + c * lonStep, grid.bounds.latMax - r * latStep];
+}
+
+// simplified marching squares -> array of {level, segments:[[lon1,lat1,lon2,lat2],...]}
+function marchingSquaresContours(grid, levels){
+  var out = [];
+  for (var li = 0; li < levels.length; li++) {
+    var level = levels[li];
+    var segments = [];
+    for (var r = 0; r < grid.rows - 1; r++) {
+      for (var c = 0; c < grid.cols - 1; c++) {
+        var v00 = grid.values[r * grid.cols + c];         // top-left (nw)
+        var v10 = grid.values[r * grid.cols + c + 1];     // top-right (ne)
+        var v01 = grid.values[(r + 1) * grid.cols + c];   // bottom-left (sw)
+        var v11 = grid.values[(r + 1) * grid.cols + c + 1]; // bottom-right (se)
+        if (!isFinite(v00) || !isFinite(v10) || !isFinite(v01) || !isFinite(v11)) continue;
+
+        var p00 = gridCellLonLat(grid, c, r);
+        var p10 = gridCellLonLat(grid, c + 1, r);
+        var p01 = gridCellLonLat(grid, c, r + 1);
+        var p11 = gridCellLonLat(grid, c + 1, r + 1);
+
+        function lerp(pa, va, pb, vb){
+          var t = (level - va) / (vb - va);
+          return [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t];
+        }
+        var edgePts = {};
+        if ((v00 - level) * (v10 - level) < 0) edgePts.top = lerp(p00, v00, p10, v10);
+        if ((v10 - level) * (v11 - level) < 0) edgePts.right = lerp(p10, v10, p11, v11);
+        if ((v01 - level) * (v11 - level) < 0) edgePts.bottom = lerp(p01, v01, p11, v11);
+        if ((v00 - level) * (v01 - level) < 0) edgePts.left = lerp(p00, v00, p01, v01);
+
+        var keys = Object.keys(edgePts);
+        if (keys.length === 2) {
+          var a = edgePts[keys[0]], b = edgePts[keys[1]];
+          segments.push([a[0], a[1], b[0], b[1]]);
+        } else if (keys.length === 4) {
+          if (v00 >= level) {
+            segments.push([edgePts.top[0], edgePts.top[1], edgePts.left[0], edgePts.left[1]]);
+            segments.push([edgePts.right[0], edgePts.right[1], edgePts.bottom[0], edgePts.bottom[1]]);
+          } else {
+            segments.push([edgePts.top[0], edgePts.top[1], edgePts.right[0], edgePts.right[1]]);
+            segments.push([edgePts.left[0], edgePts.left[1], edgePts.bottom[0], edgePts.bottom[1]]);
+          }
+        }
+      }
+    }
+    out.push({ level: level, segments: segments });
+  }
+  return out;
+}
+
+function linspace(min, max, n){
+  var out = [];
+  if (n <= 1) { out.push((min + max) / 2); return out; }
+  for (var i = 0; i < n; i++) out.push(min + (max - min) * i / (n - 1));
+  return out;
+}
+
+function valueToColorHsl(t, hueLow, hueHigh){
+  t = Math.max(0, Math.min(1, t));
+  var hue = hueLow + (hueHigh - hueLow) * t;
+  return "hsl(" + hue.toFixed(0) + ",85%,50%)";
+}
+
+function pad2(n){ return (n < 10 ? "0" : "") + n; }
+
+function formatJstTimestamp(date){
+  var t = new Date(date.getTime() + 9 * 3600 * 1000);
+  return "" + t.getUTCFullYear() + pad2(t.getUTCMonth() + 1) + pad2(t.getUTCDate()) +
+    pad2(t.getUTCHours()) + pad2(t.getUTCMinutes()) + pad2(t.getUTCSeconds());
+}
+
+// latestIso: e.g. "2026-09-07T23:20:00+09:00"; returns most-recent-first timestamps
+function buildHourlyTimestamps(latestIso, count){
+  var base = new Date(latestIso);
+  var out = [];
+  for (var i = 0; i < count; i++) {
+    out.push(formatJstTimestamp(new Date(base.getTime() - i * 3600 * 1000)));
+  }
+  return out;
+}
+
+var AmedasApp = {
+  dmsToDecimal: dmsToDecimal,
+  windDirCodeToDeg: windDirCodeToDeg,
+  degToCompass16: degToCompass16,
+  meanOf: meanOf,
+  sumOf: sumOf,
+  rmsOf: rmsOf,
+  vectorWindAverage: vectorWindAverage,
+  pointInRing: pointInRing,
+  pointInPolygonCoords: pointInPolygonCoords,
+  pointInGeometry: pointInGeometry,
+  geometryBounds: geometryBounds,
+  makeProjector: makeProjector,
+  idwGrid: idwGrid,
+  maskGridByGeometry: maskGridByGeometry,
+  marchingSquaresContours: marchingSquaresContours,
+  linspace: linspace,
+  valueToColorHsl: valueToColorHsl,
+  formatJstTimestamp: formatJstTimestamp,
+  buildHourlyTimestamps: buildHourlyTimestamps
+};
+
+if (typeof window !== "undefined") window.AmedasApp = AmedasApp;
+
+/* =========================================================================
+ * 3. アプリ本体（DOM/fetch 依存）。テスト環境（document 無し）では実行しない
+ * ========================================================================= */
+function initApp(){
+
+  var els = {
+    prefSelect: document.getElementById("prefSelect"),
+    itemSelect: document.getElementById("itemSelect"),
+    loadBtn: document.getElementById("loadBtn"),
+    resetViewBtn: document.getElementById("resetViewBtn"),
+    statusNote: document.getElementById("statusNote"),
+    summaryPanel: document.getElementById("summaryPanel"),
+    logPanel: document.getElementById("logPanel"),
+    canvas: document.getElementById("mapCanvas"),
+    tooltip: document.getElementById("tooltip"),
+    legend: document.getElementById("legend"),
+    legendTitle: document.getElementById("legendTitle"),
+    legendBar: document.getElementById("legendBar"),
+    legendMin: document.getElementById("legendMin"),
+    legendMax: document.getElementById("legendMax"),
+    layerHeatmap: document.getElementById("layerHeatmap"),
+    layerContour: document.getElementById("layerContour"),
+    layerPoints: document.getElementById("layerPoints"),
+    layerBoundary: document.getElementById("layerBoundary")
+  };
+
+  var ctx = els.canvas.getContext("2d");
+  var offscreen = document.createElement("canvas");
+  var offctx = offscreen.getContext("2d");
+
+  var cache = { amedasTable: null, geojson: null, features: {} };
+  var view = { zoom: 1, panX: 0, panY: 0, dragging: false, dragStartX: 0, dragStartY: 0, panStartX: 0, panStartY: 0 };
+  var lastResult = null; // { stations, boundaryGeometry, bounds }
+  var dirty = true;
+
+  function log(msg, level){
+    var line = document.createElement("div");
+    var t = new Date();
+    line.className = level || "";
+    line.textContent = "[" + pad2(t.getHours()) + ":" + pad2(t.getMinutes()) + ":" + pad2(t.getSeconds()) + "] " + msg;
+    els.logPanel.appendChild(line);
+    els.logPanel.scrollTop = els.logPanel.scrollHeight;
+    if (level === "err") console.error(msg); else if (level === "warn") console.warn(msg);
+  }
+
+  function showNote(msg, kind){
+    els.statusNote.className = kind || "info";
+    els.statusNote.textContent = msg;
+  }
+  function clearNote(){
+    els.statusNote.className = "";
+    els.statusNote.textContent = "";
+  }
+
+  function populatePrefectures(){
+    for (var i = 0; i < PREFS.length; i++) {
+      var opt = document.createElement("option");
+      opt.value = PREFS[i]; opt.textContent = PREFS[i];
+      els.prefSelect.appendChild(opt);
+    }
+    els.prefSelect.value = "東京都";
+  }
+
+  function fetchJson(url){
+    return fetch(url).then(function(res){
+      if (!res.ok) throw new Error("HTTP " + res.status + " : " + url);
+      return res.json();
+    });
+  }
+
+  function ensureAmedasTable(){
+    if (cache.amedasTable) return Promise.resolve(cache.amedasTable);
+    log("観測点マスタを取得中...");
+    return fetchJson(AMEDAS_TABLE_URL).then(function(d){
+      cache.amedasTable = d;
+      log("観測点マスタ取得完了（" + Object.keys(d).length + "地点）", "ok");
+      return d;
+    });
+  }
+
+  function ensureGeoJson(){
+    if (cache.geojson) return Promise.resolve(cache.geojson);
+    log("都道府県境界データ（GeoJSON）を取得中... （初回のみ、約13MB。ブラウザキャッシュ後は高速）");
+    return fetchJson(GEOJSON_URL).then(function(d){
+      cache.geojson = d;
+      log("GeoJSON取得完了（" + d.features.length + "都道府県）", "ok");
+      return d;
+    });
+  }
+
+  function findPrefFeature(geojson, name){
+    for (var i = 0; i < geojson.features.length; i++) {
+      if (geojson.features[i].properties && geojson.features[i].properties.nam_ja === name) {
+        return geojson.features[i];
+      }
+    }
+    return null;
+  }
+
+  function bboxOfGeometry(geometry){ return AmedasApp.geometryBounds(geometry); }
+
+  function selectStationsInPrefecture(amedasTable, geometry){
+    var bbox = bboxOfGeometry(geometry);
+    var padDeg = 0.1;
+    var stations = [];
+    var keys = Object.keys(amedasTable);
+    for (var i = 0; i < keys.length; i++) {
+      var code = keys[i];
+      var e = amedasTable[code];
+      var lat = AmedasApp.dmsToDecimal(e.lat);
+      var lon = AmedasApp.dmsToDecimal(e.lon);
+      if (lon < bbox.lonMin - padDeg || lon > bbox.lonMax + padDeg ||
+          lat < bbox.latMin - padDeg || lat > bbox.latMax + padDeg) continue;
+      if (!AmedasApp.pointInGeometry(lon, lat, geometry)) continue;
+      stations.push({ code: code, name: e.kjName, lat: lat, lon: lon, alt: e.alt });
+    }
+    return stations;
+  }
+
+  function fetchWithPool(items, worker, concurrency, onProgress){
+    return new Promise(function(resolve){
+      var results = new Array(items.length);
+      var next = 0, done = 0;
+      function runNext(){
+        if (next >= items.length) { if (done === items.length) resolve(results); return; }
+        var idx = next++;
+        worker(items[idx]).then(function(r){
+          results[idx] = r; done++;
+          if (onProgress) onProgress(done, items.length);
+          if (done === items.length) resolve(results); else runNext();
+        });
+      }
+      var starters = Math.min(concurrency, items.length);
+      for (var i = 0; i < starters; i++) runNext();
+      if (items.length === 0) resolve(results);
+    });
+  }
+
+  function fetchMapSnapshot(ts){
+    return fetch(mapUrl(ts)).then(function(res){
+      if (!res.ok) return null;
+      return res.json();
+    }).catch(function(){ return null; });
+  }
+
+  function buildStationSeries(stations, snapshots){
+    var byCode = {};
+    for (var i = 0; i < stations.length; i++) {
+      byCode[stations[i].code] = {
+        code: stations[i].code, name: stations[i].name, lat: stations[i].lat, lon: stations[i].lon,
+        temps: [], humidities: [], windPairs: [], windSpeeds: [], precipitation24h: null
+      };
+    }
+    // snapshots: most-recent-first
+    for (var s = 0; s < snapshots.length; s++) {
+      var snap = snapshots[s];
+      if (!snap) continue;
+      for (var code in byCode) {
+        var rec = snap[code];
+        if (!rec) continue;
+        var st = byCode[code];
+        if (rec.temp && typeof rec.temp[0] === "number" && rec.temp[1] === 0) st.temps.push(rec.temp[0]);
+        if (rec.humidity && typeof rec.humidity[0] === "number" && rec.humidity[1] === 0) st.humidities.push(rec.humidity[0]);
+        if (rec.wind && typeof rec.wind[0] === "number" && rec.wind[1] === 0) {
+          st.windSpeeds.push(rec.wind[0]);
+          var dirDeg = (rec.windDirection && rec.windDirection[1] === 0) ? AmedasApp.windDirCodeToDeg(rec.windDirection[0]) : null;
+          st.windPairs.push({ speed: rec.wind[0], dirDeg: dirDeg });
+        }
+        if (s === 0 && rec.precipitation24h && typeof rec.precipitation24h[0] === "number" && rec.precipitation24h[1] === 0) {
+          st.precipitation24h = rec.precipitation24h[0];
+        }
+      }
+    }
+    var out = [];
+    for (var c in byCode) {
+      var st2 = byCode[c];
+      var vec = AmedasApp.vectorWindAverage(st2.windPairs);
+      out.push({
+        code: st2.code, name: st2.name, lat: st2.lat, lon: st2.lon,
+        tempMean: AmedasApp.meanOf(st2.temps),
+        humidityMean: AmedasApp.meanOf(st2.humidities),
+        windVectorSpeed: vec.speed, windVectorDir: vec.dirDeg,
+        windRms: AmedasApp.rmsOf(st2.windSpeeds),
+        precipitation24h: st2.precipitation24h
+      });
+    }
+    return out;
+  }
+
+  function computePrefStats(stationSeries){
+    return {
+      precipitation: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.precipitation24h; })) },
+      temperature: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.tempMean; })) },
+      humidity: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.humidityMean; })) },
+      windVector: AmedasApp.vectorWindAverage(stationSeries.map(function(s){ return { speed: s.windVectorSpeed, dirDeg: s.windVectorDir }; })),
+      windRms: { speed: AmedasApp.rmsOf(stationSeries.map(function(s){ return s.windRms; })) }
+    };
+  }
+
+  function fmt(v, digits){
+    if (v === null || v === undefined || !isFinite(v)) return "―";
+    return v.toFixed(digits === undefined ? 1 : digits);
+  }
+
+  function renderSummary(prefStats, stationCount){
+    var html = "<table>";
+    html += "<tr><td class='k'>観測点数</td><td>" + stationCount + "</td></tr>";
+    html += "<tr><td class='k'>降水量 累計平均</td><td>" + fmt(prefStats.precipitation.mean) + " mm</td></tr>";
+    html += "<tr><td class='k'>気温 平均</td><td>" + fmt(prefStats.temperature.mean) + " ℃</td></tr>";
+    html += "<tr><td class='k'>湿度 平均</td><td>" + fmt(prefStats.humidity.mean, 0) + " %</td></tr>";
+    html += "<tr><td class='k'>風 合成ベクトル平均</td><td>" + fmt(prefStats.windVector.speed) + " m/s ／ " +
+      AmedasApp.degToCompass16(prefStats.windVector.dirDeg) + " (" + fmt(prefStats.windVector.dirDeg, 0) + "°)</td></tr>";
+    html += "<tr><td class='k'>風速 RMS</td><td>" + fmt(prefStats.windRms.speed) + " m/s</td></tr>";
+    html += "</table>";
+    els.summaryPanel.innerHTML = html;
+  }
+
+  function valuesForItem(stationSeries, item){
+    return stationSeries.map(function(s){
+      var v;
+      if (item === "precipitation") v = s.precipitation24h;
+      else if (item === "temperature") v = s.tempMean;
+      else if (item === "humidity") v = s.humidityMean;
+      else if (item === "windSpeed") v = s.windVectorSpeed;
+      else v = s.windVectorDir;
+      return { lon: s.lon, lat: s.lat, value: v, name: s.name };
+    });
+  }
+
+  function requestRedraw(){ dirty = true; }
+
+  function resizeCanvasToDisplaySize(){
+    var rect = els.canvas.parentElement.getBoundingClientRect();
+    var w = Math.max(300, Math.floor(rect.width));
+    var h = Math.max(300, Math.floor(rect.height));
+    if (els.canvas.width !== w || els.canvas.height !== h) {
+      els.canvas.width = w; els.canvas.height = h; requestRedraw();
+    }
+  }
+
+  function screenXY(projector, lon, lat){
+    var p = projector.toXY(lon, lat);
+    return [p[0] * view.zoom + view.panX, p[1] * view.zoom + view.panY];
+  }
+
+  function buildHeatmapBitmap(grid, item){
+    var vals = grid.values.filter(function(v){ return isFinite(v); });
+    var min = vals.length ? Math.min.apply(null, vals) : 0;
+    var max = vals.length ? Math.max.apply(null, vals) : 1;
+    if (min === max) { min -= 1; max += 1; }
+    offscreen.width = grid.cols; offscreen.height = grid.rows;
+    var imgData = offctx.createImageData(grid.cols, grid.rows);
+    for (var i = 0; i < grid.values.length; i++) {
+      var v = grid.values[i];
+      var o = i * 4;
+      if (!isFinite(v)) { imgData.data[o + 3] = 0; continue; }
+      var t = (v - min) / (max - min);
+      var rgb = hslToRgb(210 - 210 * t, 0.85, 0.5); // 210=blue(low) -> 0=red(high)
+      imgData.data[o] = rgb[0]; imgData.data[o + 1] = rgb[1]; imgData.data[o + 2] = rgb[2]; imgData.data[o + 3] = 190;
+    }
+    offctx.putImageData(imgData, 0, 0);
+    return { min: min, max: max };
+  }
+
+  function hslToRgb(h, s, l){
+    h = ((h % 360) + 360) % 360;
+    var c = (1 - Math.abs(2 * l - 1)) * s;
+    var x = c * (1 - Math.abs((h / 60) % 2 - 1));
+    var m = l - c / 2;
+    var r, g, b;
+    if (h < 60) { r=c;g=x;b=0; } else if (h < 120) { r=x;g=c;b=0; }
+    else if (h < 180) { r=0;g=c;b=x; } else if (h < 240) { r=0;g=x;b=c; }
+    else if (h < 300) { r=x;g=0;b=c; } else { r=c;g=0;b=x; }
+    return [Math.round((r+m)*255), Math.round((g+m)*255), Math.round((b+m)*255)];
+  }
+
+  function updateLegend(item, min, max){
+    if (item === "windDirection") { els.legend.style.display = "none"; return; }
+    els.legend.style.display = "block";
+    els.legendTitle.textContent = ITEM_META[item].label + " (" + ITEM_META[item].unit + ")";
+    els.legendBar.style.background = "linear-gradient(to right, hsl(210,85%,50%), hsl(105,85%,50%), hsl(0,85%,50%))";
+    els.legendMin.textContent = fmt(min);
+    els.legendMax.textContent = fmt(max);
+  }
+
+  function draw(){
+    var w = els.canvas.width, h = els.canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#0a1220";
+    ctx.fillRect(0, 0, w, h);
+    if (!lastResult) return;
+
+    var projector = lastResult.projector;
+    var item = els.itemSelect.value;
+
+    // heatmap
+    if (els.layerHeatmap.checked && lastResult.grids[item]) {
+      var g = lastResult.grids[item];
+      var tl = screenXY(projector, g.bounds.lonMin, g.bounds.latMax);
+      var br = screenXY(projector, g.bounds.lonMax, g.bounds.latMin);
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(lastResult.heatmapBitmaps[item], tl[0], tl[1], br[0] - tl[0], br[1] - tl[1]);
+    }
+
+    // boundary
+    if (els.layerBoundary.checked) {
+      ctx.strokeStyle = "#7fb7ff"; ctx.lineWidth = 1.5;
+      drawGeometry(lastResult.boundaryGeometry, projector);
+    }
+
+    // contours
+    if (els.layerContour.checked && lastResult.contours[item]) {
+      ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 1;
+      var conts = lastResult.contours[item];
+      for (var ci = 0; ci < conts.length; ci++) {
+        var segs = conts[ci].segments;
+        for (var si = 0; si < segs.length; si++) {
+          var s = segs[si];
+          var a = screenXY(projector, s[0], s[1]);
+          var b = screenXY(projector, s[2], s[3]);
+          ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+        }
+      }
+    }
+
+    // points / wind arrows
+    if (els.layerPoints.checked) {
+      for (var i = 0; i < lastResult.stationSeries.length; i++) {
+        var st = lastResult.stationSeries[i];
+        var p = screenXY(projector, st.lon, st.lat);
+        ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffffff"; ctx.fill();
+        ctx.strokeStyle = "#0a1220"; ctx.lineWidth = 1; ctx.stroke();
+
+        if (item === "windDirection" && st.windVectorDir !== null && st.windVectorSpeed !== null) {
+          var rad = (st.windVectorDir + 180) * Math.PI / 180; // arrow points where wind blows TO
+          var len = 10 + Math.min(st.windVectorSpeed, 15) * 2;
+          var ex = p[0] + Math.sin(rad) * len;
+          var ey = p[1] - Math.cos(rad) * len;
+          ctx.strokeStyle = "#ffcf5c"; ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(ex, ey); ctx.stroke();
+        }
+      }
+    }
+  }
+
+  function drawGeometry(geometry, projector){
+    function drawPolygon(poly){
+      for (var r = 0; r < poly.length; r++) {
+        var ring = poly[r];
+        ctx.beginPath();
+        for (var i = 0; i < ring.length; i++) {
+          var p = screenXY(projector, ring[i][0], ring[i][1]);
+          if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+        }
+        ctx.closePath(); ctx.stroke();
+      }
+    }
+    if (geometry.type === "Polygon") drawPolygon(geometry.coordinates);
+    else if (geometry.type === "MultiPolygon") {
+      for (var i = 0; i < geometry.coordinates.length; i++) drawPolygon(geometry.coordinates[i]);
+    }
+  }
+
+  function frame(){
+    resizeCanvasToDisplaySize();
+    if (dirty) { draw(); dirty = false; }
+    requestAnimationFrame(frame);
+  }
+
+  function attachInteraction(){
+    els.canvas.addEventListener("mousedown", function(e){
+      view.dragging = true; els.canvas.classList.add("dragging");
+      view.dragStartX = e.clientX; view.dragStartY = e.clientY;
+      view.panStartX = view.panX; view.panStartY = view.panY;
+    });
+    window.addEventListener("mouseup", function(){ view.dragging = false; els.canvas.classList.remove("dragging"); });
+    els.canvas.addEventListener("mousemove", function(e){
+      var rect = els.canvas.getBoundingClientRect();
+      var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      if (view.dragging) {
+        view.panX = view.panStartX + (e.clientX - view.dragStartX);
+        view.panY = view.panStartY + (e.clientY - view.dragStartY);
+        requestRedraw();
+        els.tooltip.style.display = "none";
+        return;
+      }
+      handleHover(mx, my);
+    });
+    els.canvas.addEventListener("mouseleave", function(){ els.tooltip.style.display = "none"; });
+    els.canvas.addEventListener("wheel", function(e){
+      e.preventDefault();
+      var rect = els.canvas.getBoundingClientRect();
+      var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      var factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      var newZoom = Math.max(0.5, Math.min(10, view.zoom * factor));
+      var baseX = (mx - view.panX) / view.zoom, baseY = (my - view.panY) / view.zoom;
+      view.panX = mx - baseX * newZoom; view.panY = my - baseY * newZoom;
+      view.zoom = newZoom;
+      requestRedraw();
+    }, { passive: false });
+
+    els.resetViewBtn.addEventListener("click", function(){
+      view.zoom = 1; view.panX = 0; view.panY = 0; requestRedraw();
+    });
+  }
+
+  function handleHover(mx, my){
+    if (!lastResult) { els.tooltip.style.display = "none"; return; }
+    var projector = lastResult.projector;
+    var best = null, bestD = 10 * 10;
+    for (var i = 0; i < lastResult.stationSeries.length; i++) {
+      var st = lastResult.stationSeries[i];
+      var p = screenXY(projector, st.lon, st.lat);
+      var dx = p[0] - mx, dy = p[1] - my, d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = st; }
+    }
+    if (!best) { els.tooltip.style.display = "none"; return; }
+    var item = els.itemSelect.value;
+    var meta = ITEM_META[item];
+    var v;
+    if (item === "precipitation") v = fmt(best.precipitation24h) + " mm";
+    else if (item === "temperature") v = fmt(best.tempMean) + " ℃";
+    else if (item === "humidity") v = fmt(best.humidityMean, 0) + " %";
+    else if (item === "windSpeed") v = fmt(best.windVectorSpeed) + " m/s";
+    else v = AmedasApp.degToCompass16(best.windVectorDir) + " / " + fmt(best.windVectorDir, 0) + "° (" + fmt(best.windVectorSpeed) + " m/s)";
+    els.tooltip.textContent = best.name + "：" + v;
+    els.tooltip.style.left = (mx + 14) + "px";
+    els.tooltip.style.top = (my + 10) + "px";
+    els.tooltip.style.display = "block";
+  }
+
+  function runLoad(){
+    var interval = document.querySelector('input[name="interval"]:checked').value;
+    if (interval !== "24h") {
+      showNote("気象庁の公開APIは実測データの保持期間が短く（全国スナップショットは約1日分、観測点別データも約9〜10日分のみ）、過去1か月・1年の実測統計はこのアプリでは取得できません。過去24時間を選択してください。", "info");
+      lastResult = null; requestRedraw();
+      els.summaryPanel.textContent = "過去1か月・1年は実測データ取得不可のため未対応です。";
+      return;
+    }
+    clearNote();
+    els.loadBtn.disabled = true;
+    var prefName = els.prefSelect.value;
+    log("=== " + prefName + " の取得を開始 ===");
+
+    Promise.all([ensureAmedasTable(), ensureGeoJson()]).then(function(res){
+      var amedasTable = res[0], geojson = res[1];
+      var feature = findPrefFeature(geojson, prefName);
+      if (!feature) throw new Error("GeoJSONに一致する都道府県が見つかりません: " + prefName);
+
+      var stations = selectStationsInPrefecture(amedasTable, feature.geometry);
+      log(prefName + " 内のアメダス観測点: " + stations.length + " 地点");
+      if (stations.length === 0) throw new Error("対象都道府県内に観測点が見つかりませんでした");
+
+      return fetch(LATEST_TIME_URL).then(function(res){
+        if (!res.ok) throw new Error("最新観測時刻の取得に失敗しました: HTTP " + res.status);
+        return res.text();
+      }).then(function(latestIsoText){
+        var latestIso = latestIsoText.trim();
+        log("最新観測時刻: " + latestIso);
+        var timestamps = AmedasApp.buildHourlyTimestamps(latestIso, 24);
+        var progressCount = 0;
+        return fetchWithPool(timestamps, fetchMapSnapshot, 4, function(done, total){
+          progressCount = done;
+          if (done % 4 === 0 || done === total) log("観測データ取得中... " + done + "/" + total);
+        }).then(function(snapshots){
+          var okCount = snapshots.filter(function(s){ return s !== null; }).length;
+          log("スナップショット取得完了: " + okCount + "/" + timestamps.length + " 件成功", okCount > 0 ? "ok" : "err");
+          if (okCount === 0) throw new Error("観測データを1件も取得できませんでした");
+
+          var stationSeries = buildStationSeries(stations, snapshots);
+          var prefStats = computePrefStats(stationSeries);
+          renderSummary(prefStats, stationSeries.length);
+
+          var bounds = AmedasApp.geometryBounds(feature.geometry);
+          var padDeg = Math.max((bounds.lonMax - bounds.lonMin), (bounds.latMax - bounds.latMin)) * 0.08;
+          bounds = { lonMin: bounds.lonMin - padDeg, lonMax: bounds.lonMax + padDeg,
+                     latMin: bounds.latMin - padDeg, latMax: bounds.latMax + padDeg };
+          var projector = AmedasApp.makeProjector(bounds, els.canvas.width || 800, els.canvas.height || 600, 24);
+
+          var grids = {}, contours = {}, heatmapBitmaps = {};
+          var items = ["precipitation", "temperature", "humidity", "windSpeed"];
+          for (var ii = 0; ii < items.length; ii++) {
+            var it = items[ii];
+            var pts = valuesForItem(stationSeries, it);
+            var grid = AmedasApp.idwGrid(pts, bounds, 60, 60, 2);
+            grid = AmedasApp.maskGridByGeometry(grid, feature.geometry);
+            grids[it] = grid;
+            var finiteVals = grid.values.filter(function(v){ return isFinite(v); });
+            var min = finiteVals.length ? Math.min.apply(null, finiteVals) : 0;
+            var max = finiteVals.length ? Math.max.apply(null, finiteVals) : 1;
+            var levels = AmedasApp.linspace(min, max, 7).slice(1, -1);
+            contours[it] = AmedasApp.marchingSquaresContours(grid, levels);
+          }
+
+          lastResult = {
+            stationSeries: stationSeries, boundaryGeometry: feature.geometry,
+            projector: projector, grids: grids, contours: contours, heatmapBitmaps: {}
+          };
+          view.zoom = 1; view.panX = 0; view.panY = 0;
+
+          for (var jj = 0; jj < items.length; jj++) {
+            var itj = items[jj];
+            var mm = buildHeatmapBitmap(grids[itj], itj);
+            var bmp = document.createElement("canvas");
+            bmp.width = offscreen.width; bmp.height = offscreen.height;
+            bmp.getContext("2d").drawImage(offscreen, 0, 0);
+            lastResult.heatmapBitmaps[itj] = bmp;
+            if (els.itemSelect.value === itj) updateLegend(itj, mm.min, mm.max);
+          }
+          if (els.itemSelect.value === "windDirection") updateLegend("windDirection", 0, 0);
+
+          requestRedraw();
+          log("描画完了", "ok");
+        });
+      });
+    }).catch(function(err){
+      log("エラー: " + err.message, "err");
+      showNote("エラーが発生しました: " + err.message, "error");
+    }).then(function(){
+      els.loadBtn.disabled = false;
+    });
+  }
+
+  function onItemOrLayerChange(){
+    if (!lastResult) return;
+    var item = els.itemSelect.value;
+    if (item !== "windDirection" && lastResult.heatmapBitmaps[item]) {
+      var vals = lastResult.grids[item].values.filter(function(v){ return isFinite(v); });
+      var min = vals.length ? Math.min.apply(null, vals) : 0;
+      var max = vals.length ? Math.max.apply(null, vals) : 1;
+      updateLegend(item, min, max);
+    } else {
+      updateLegend("windDirection", 0, 0);
+    }
+    requestRedraw();
+  }
+
+  populatePrefectures();
+  attachInteraction();
+  els.loadBtn.addEventListener("click", runLoad);
+  els.itemSelect.addEventListener("change", onItemOrLayerChange);
+  els.layerHeatmap.addEventListener("change", requestRedraw);
+  els.layerContour.addEventListener("change", requestRedraw);
+  els.layerPoints.addEventListener("change", requestRedraw);
+  els.layerBoundary.addEventListener("change", requestRedraw);
+  window.addEventListener("resize", requestRedraw);
+
+  requestAnimationFrame(frame);
+  log("初期化完了。都道府県を選び「取得・描画」を押してください。");
+}
+
+if (typeof document !== "undefined" && document.getElementById) {
+  initApp();
+}
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "name": "amedas-pref-viewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "都道府県別アメダス統計・可視化ビューア（単一HTMLアプリ）",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "Apache-2.0"
+}
