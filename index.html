@@ -68,12 +68,17 @@
       <select id="prefSelect"></select>
 
       <label style="margin-top:8px;">統計区間</label>
+      <div class="radioRow"><input type="radio" name="interval" id="int1h" value="1h"><label for="int1h">過去1時間（実測）</label></div>
       <div class="radioRow"><input type="radio" name="interval" id="int24h" value="24h" checked><label for="int24h">過去24時間（実測）</label></div>
-      <div class="radioRow"><input type="radio" name="interval" id="int1m" value="1m"><label for="int1m">過去1か月</label></div>
-      <div class="radioRow"><input type="radio" name="interval" id="int1y" value="1y"><label for="int1y">過去1年</label></div>
 
       <button id="loadBtn" type="button">取得・描画</button>
-      <div class="hint">気象庁の公開APIは実測データの保持期間が短いため、過去1か月・1年は実測データを取得できません（詳細はREADME参照）。</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>地域（離島など）</legend>
+      <label for="regionSelect">表示する地域</label>
+      <select id="regionSelect" disabled><option value="0">（「取得・描画」後に選択可能）</option></select>
+      <div class="hint" id="regionHint">本土から離れた離島（例：東京都の小笠原諸島）は、本土とは別の地域として切り替えて表示します。</div>
     </fieldset>
 
     <fieldset>
@@ -144,6 +149,26 @@ var ITEM_META = {
   windSpeed:     { label:"風速",   unit:"m/s" },
   windDirection: { label:"風向",   unit:"" }
 };
+
+// 統計区間ごとのメタ情報。JMAスナップショットは10分間隔で提供されるため、
+// 「過去1時間」は10分刻み6点、「過去24時間」は1時間刻み24点を実測値から算出する。
+var INTERVAL_META = {
+  "1h":  { label:"過去1時間",  count:6,  stepMinutes:10, precipField:"precipitation1h" },
+  "24h": { label:"過去24時間", count:24, stepMinutes:60, precipField:"precipitation24h" }
+};
+
+// 同一都道府県内でも本土から大きく離れた離島（例：小笠原諸島）は、
+// 描画倍率が本土側だけ極端に小さくなるのを避けるため別地域として分割する。
+// 単位は度（緯度経度）。ポリゴン外接矩形どうしの隙間がこの値以下なら同一地域とみなす。
+// 注意: 値を大きくしすぎると、伊豆諸島のように島々が飛び石状に連なる地域では
+// 隣接ペアの隙間が小さいまま連鎖的に結合してしまい、結果的に本土クラスタに
+// 巻き込まれてしまう（実データで検証済み: 東京都本土-大島間は約0.70度）。
+// そのため直接の飛躍的な結合を避けられる小さめの値を採用する。
+var REGION_GAP_DEG = 0.3;
+
+// 県境をまたいだ観測点をヒートマップ補間に取り込み、県境の外側までなめらかに
+// 描画するための緩衝距離（度）。約0.15度 ≒ 15〜17km。
+var BORDER_BUFFER_DEG = 0.15;
 
 /* =========================================================================
  * 2. 純粋関数群（テスト対象）: window.AmedasApp としてエクスポート
@@ -251,6 +276,114 @@ function pointInGeometry(lon, lat, geometry){
   return false;
 }
 
+function polygonBounds(polygon){
+  var lonMin = Infinity, lonMax = -Infinity, latMin = Infinity, latMax = -Infinity;
+  for (var r = 0; r < polygon.length; r++) {
+    var ring = polygon[r];
+    for (var i = 0; i < ring.length; i++) {
+      var lon = ring[i][0], lat = ring[i][1];
+      if (lon < lonMin) lonMin = lon;
+      if (lon > lonMax) lonMax = lon;
+      if (lat < latMin) latMin = lat;
+      if (lat > latMax) latMax = lat;
+    }
+  }
+  return { lonMin: lonMin, lonMax: lonMax, latMin: latMin, latMax: latMax };
+}
+
+// 2つの外接矩形の隙間（重なっていれば0）
+function bboxGapDistance(a, b){
+  var dx = Math.max(0, Math.max(b.lonMin - a.lonMax, a.lonMin - b.lonMax));
+  var dy = Math.max(0, Math.max(b.latMin - a.latMax, a.latMin - b.latMax));
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// MultiPolygon（またはPolygon）を、外接矩形どうしの隙間がgapDeg以下のポリゴン群ごとに
+// クラスタリングする（Union-Find）。本土と離島のように地理的に離れた地域を分離するために使用。
+// 戻り値: [{ polygons: [polygon,...], bounds, geometry }, ...]
+function clusterPolygons(geometry, gapDeg){
+  var polys = geometry.type === "MultiPolygon" ? geometry.coordinates : [geometry.coordinates];
+  var n = polys.length;
+  var bounds = polys.map(polygonBounds);
+  var parent = [];
+  for (var i = 0; i < n; i++) parent.push(i);
+  function find(x){ while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+  function union(a, b){ a = find(a); b = find(b); if (a !== b) parent[a] = b; }
+  for (var p = 0; p < n; p++) {
+    for (var q = p + 1; q < n; q++) {
+      if (bboxGapDistance(bounds[p], bounds[q]) <= gapDeg) union(p, q);
+    }
+  }
+  var groupsMap = {};
+  for (var k = 0; k < n; k++) {
+    var root = find(k);
+    if (!groupsMap[root]) groupsMap[root] = [];
+    groupsMap[root].push(k);
+  }
+  var clusters = [];
+  Object.keys(groupsMap).forEach(function(root){
+    var idxs = groupsMap[root];
+    var clusterPolys = idxs.map(function(i){ return polys[i]; });
+    var b = { lonMin: Infinity, lonMax: -Infinity, latMin: Infinity, latMax: -Infinity };
+    idxs.forEach(function(i){
+      b.lonMin = Math.min(b.lonMin, bounds[i].lonMin);
+      b.lonMax = Math.max(b.lonMax, bounds[i].lonMax);
+      b.latMin = Math.min(b.latMin, bounds[i].latMin);
+      b.latMax = Math.max(b.latMax, bounds[i].latMax);
+    });
+    var geom = clusterPolys.length === 1
+      ? { type: "Polygon", coordinates: clusterPolys[0] }
+      : { type: "MultiPolygon", coordinates: clusterPolys };
+    clusters.push({ polygons: clusterPolys, bounds: b, geometry: geom });
+  });
+  return clusters;
+}
+
+// 点と線分の最短距離の2乗
+function distPointToSegmentSq(px, py, ax, ay, bx, by){
+  var dx = bx - ax, dy = by - ay;
+  var lenSq = dx * dx + dy * dy;
+  var t = lenSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lenSq : 0;
+  if (t < 0) t = 0; else if (t > 1) t = 1;
+  var cx = ax + t * dx, cy = ay + t * dy;
+  var ex = px - cx, ey = py - cy;
+  return ex * ex + ey * ey;
+}
+
+function ringWithinBuffer(lon, lat, ring, bufferDeg){
+  for (var i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    var ax = ring[j][0], ay = ring[j][1], bx = ring[i][0], by = ring[i][1];
+    // 軸並行の外接矩形（bufferDeg分拡張）による早期棄却
+    if (lon < Math.min(ax, bx) - bufferDeg || lon > Math.max(ax, bx) + bufferDeg ||
+        lat < Math.min(ay, by) - bufferDeg || lat > Math.max(ay, by) + bufferDeg) continue;
+    if (distPointToSegmentSq(lon, lat, ax, ay, bx, by) <= bufferDeg * bufferDeg) return true;
+  }
+  return false;
+}
+
+function polygonWithinBuffer(lon, lat, polygon, bufferDeg){
+  for (var r = 0; r < polygon.length; r++) {
+    if (ringWithinBuffer(lon, lat, polygon[r], bufferDeg)) return true;
+  }
+  return false;
+}
+
+// 点がジオメトリの内部、またはその境界からbufferDeg以内にあるか
+function pointNearGeometry(lon, lat, geometry, bufferDeg){
+  if (!geometry) return false;
+  if (pointInGeometry(lon, lat, geometry)) return true;
+  if (!bufferDeg) return false;
+  if (geometry.type === "Polygon") return polygonWithinBuffer(lon, lat, geometry.coordinates, bufferDeg);
+  if (geometry.type === "MultiPolygon") {
+    var polys = geometry.coordinates;
+    for (var i = 0; i < polys.length; i++) {
+      if (polygonWithinBuffer(lon, lat, polys[i], bufferDeg)) return true;
+    }
+    return false;
+  }
+  return false;
+}
+
 function geometryBounds(geometry){
   var lonMin = Infinity, lonMax = -Infinity, latMin = Infinity, latMax = -Infinity;
   function visitRing(ring){
@@ -324,7 +457,9 @@ function idwGrid(points, bounds, cols, rows, power){
   return { values: values, cols: cols, rows: rows, bounds: bounds };
 }
 
-function maskGridByGeometry(grid, geometry){
+// bufferDeg (省略時0) を指定すると、ジオメトリ境界からその距離以内のセルも残す
+// （県境の外側までヒートマップをなめらかに描画するために使用）。
+function maskGridByGeometry(grid, geometry, bufferDeg){
   var out = grid.values.slice();
   var lonStep = (grid.bounds.lonMax - grid.bounds.lonMin) / (grid.cols - 1 || 1);
   var latStep = (grid.bounds.latMax - grid.bounds.latMin) / (grid.rows - 1 || 1);
@@ -332,7 +467,7 @@ function maskGridByGeometry(grid, geometry){
     var lat = grid.bounds.latMax - r * latStep;
     for (var c = 0; c < grid.cols; c++) {
       var lon = grid.bounds.lonMin + c * lonStep;
-      if (!pointInGeometry(lon, lat, geometry)) out[r * grid.cols + c] = NaN;
+      if (!pointNearGeometry(lon, lat, geometry, bufferDeg || 0)) out[r * grid.cols + c] = NaN;
     }
   }
   return { values: out, cols: grid.cols, rows: grid.rows, bounds: grid.bounds };
@@ -414,12 +549,13 @@ function formatJstTimestamp(date){
     pad2(t.getUTCHours()) + pad2(t.getUTCMinutes()) + pad2(t.getUTCSeconds());
 }
 
-// latestIso: e.g. "2026-09-07T23:20:00+09:00"; returns most-recent-first timestamps
-function buildHourlyTimestamps(latestIso, count){
+// latestIso: e.g. "2026-09-07T23:20:00+09:00"; returns most-recent-first timestamps,
+// stepMinutes間隔でcount件（例: 10分刻み6件 = 過去1時間、60分刻み24件 = 過去24時間）
+function buildTimestamps(latestIso, count, stepMinutes){
   var base = new Date(latestIso);
   var out = [];
   for (var i = 0; i < count; i++) {
-    out.push(formatJstTimestamp(new Date(base.getTime() - i * 3600 * 1000)));
+    out.push(formatJstTimestamp(new Date(base.getTime() - i * stepMinutes * 60 * 1000)));
   }
   return out;
 }
@@ -436,6 +572,11 @@ var AmedasApp = {
   pointInPolygonCoords: pointInPolygonCoords,
   pointInGeometry: pointInGeometry,
   geometryBounds: geometryBounds,
+  polygonBounds: polygonBounds,
+  bboxGapDistance: bboxGapDistance,
+  clusterPolygons: clusterPolygons,
+  distPointToSegmentSq: distPointToSegmentSq,
+  pointNearGeometry: pointNearGeometry,
   makeProjector: makeProjector,
   idwGrid: idwGrid,
   maskGridByGeometry: maskGridByGeometry,
@@ -443,7 +584,7 @@ var AmedasApp = {
   linspace: linspace,
   valueToColorHsl: valueToColorHsl,
   formatJstTimestamp: formatJstTimestamp,
-  buildHourlyTimestamps: buildHourlyTimestamps
+  buildTimestamps: buildTimestamps
 };
 
 if (typeof window !== "undefined") window.AmedasApp = AmedasApp;
@@ -471,14 +612,19 @@ function initApp(){
     layerHeatmap: document.getElementById("layerHeatmap"),
     layerContour: document.getElementById("layerContour"),
     layerPoints: document.getElementById("layerPoints"),
-    layerBoundary: document.getElementById("layerBoundary")
+    layerBoundary: document.getElementById("layerBoundary"),
+    regionSelect: document.getElementById("regionSelect"),
+    regionHint: document.getElementById("regionHint")
   };
 
   var ctx = els.canvas.getContext("2d");
   var offscreen = document.createElement("canvas");
   var offctx = offscreen.getContext("2d");
 
-  var cache = { amedasTable: null, geojson: null, features: {} };
+  var cache = {
+    amedasTable: null, geojson: null, features: {},
+    regions: null, snapshots: null, precipField: null, intervalLabel: ""
+  };
   var view = { zoom: 1, panX: 0, panY: 0, dragging: false, dragStartX: 0, dragStartY: 0, panStartX: 0, panStartY: 0 };
   var lastResult = null; // { stations, boundaryGeometry, bounds }
   var dirty = true;
@@ -547,11 +693,12 @@ function initApp(){
     return null;
   }
 
-  function bboxOfGeometry(geometry){ return AmedasApp.geometryBounds(geometry); }
-
-  function selectStationsInPrefecture(amedasTable, geometry){
-    var bbox = bboxOfGeometry(geometry);
-    var padDeg = 0.1;
+  // bufferDeg (省略時0) を指定すると、ジオメトリ境界からその距離以内の観測点も含める
+  // （県境をまたいだ近傍観測点をヒートマップ補間に取り込むために使用）。
+  function selectStationsInGeometry(amedasTable, geometry, bufferDeg){
+    bufferDeg = bufferDeg || 0;
+    var bbox = AmedasApp.geometryBounds(geometry);
+    var padDeg = Math.max(0.1, bufferDeg + 0.05);
     var stations = [];
     var keys = Object.keys(amedasTable);
     for (var i = 0; i < keys.length; i++) {
@@ -561,10 +708,47 @@ function initApp(){
       var lon = AmedasApp.dmsToDecimal(e.lon);
       if (lon < bbox.lonMin - padDeg || lon > bbox.lonMax + padDeg ||
           lat < bbox.latMin - padDeg || lat > bbox.latMax + padDeg) continue;
-      if (!AmedasApp.pointInGeometry(lon, lat, geometry)) continue;
+      if (!AmedasApp.pointNearGeometry(lon, lat, geometry, bufferDeg)) continue;
       stations.push({ code: code, name: e.kjName, lat: lat, lon: lon, alt: e.alt });
     }
     return stations;
+  }
+
+  // 都道府県ジオメトリを本土・離島などの地域に分割し、実際にアメダス観測点を含む
+  // クラスタのみを候補地域として返す（観測点数の多い順、先頭が最大＝本土扱い）。
+  function buildRegions(amedasTable, prefGeometry){
+    var clusters = AmedasApp.clusterPolygons(prefGeometry, REGION_GAP_DEG);
+    var regions = [];
+    for (var i = 0; i < clusters.length; i++) {
+      var stations = selectStationsInGeometry(amedasTable, clusters[i].geometry, 0);
+      if (stations.length === 0) continue;
+      regions.push({ geometry: clusters[i].geometry, stationCount: stations.length, label: "" });
+    }
+    regions.sort(function(a, b){ return b.stationCount - a.stationCount; });
+    if (regions.length <= 1) {
+      if (regions[0]) regions[0].label = "全域";
+    } else {
+      regions[0].label = "本土";
+      for (var r = 1; r < regions.length; r++) {
+        regions[r].label = regions.length === 2 ? "離島" : ("離島" + r);
+      }
+    }
+    return regions;
+  }
+
+  function populateRegionSelect(regions){
+    els.regionSelect.innerHTML = "";
+    for (var i = 0; i < regions.length; i++) {
+      var opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = regions[i].label + "（観測点" + regions[i].stationCount + "）";
+      els.regionSelect.appendChild(opt);
+    }
+    els.regionSelect.value = "0";
+    els.regionSelect.disabled = regions.length <= 1;
+    els.regionHint.textContent = regions.length > 1
+      ? "この都道府県には本土から離れた地域が" + (regions.length - 1) + "件あります。上のリストで切り替えられます。"
+      : "この都道府県は単一の地域として扱われます。";
   }
 
   function fetchWithPool(items, worker, concurrency, onProgress){
@@ -593,12 +777,14 @@ function initApp(){
     }).catch(function(){ return null; });
   }
 
-  function buildStationSeries(stations, snapshots){
+  // precipField: "precipitation1h" | "precipitation24h"（統計区間に応じてJMAスナップショットの
+  // どの累計降水量フィールドを採用するかを切り替える）
+  function buildStationSeries(stations, snapshots, precipField){
     var byCode = {};
     for (var i = 0; i < stations.length; i++) {
       byCode[stations[i].code] = {
         code: stations[i].code, name: stations[i].name, lat: stations[i].lat, lon: stations[i].lon,
-        temps: [], humidities: [], windPairs: [], windSpeeds: [], precipitation24h: null
+        temps: [], humidities: [], windPairs: [], windSpeeds: [], precipitation: null
       };
     }
     // snapshots: most-recent-first
@@ -616,8 +802,9 @@ function initApp(){
           var dirDeg = (rec.windDirection && rec.windDirection[1] === 0) ? AmedasApp.windDirCodeToDeg(rec.windDirection[0]) : null;
           st.windPairs.push({ speed: rec.wind[0], dirDeg: dirDeg });
         }
-        if (s === 0 && rec.precipitation24h && typeof rec.precipitation24h[0] === "number" && rec.precipitation24h[1] === 0) {
-          st.precipitation24h = rec.precipitation24h[0];
+        var precipRec = rec[precipField];
+        if (s === 0 && precipRec && typeof precipRec[0] === "number" && precipRec[1] === 0) {
+          st.precipitation = precipRec[0];
         }
       }
     }
@@ -631,7 +818,7 @@ function initApp(){
         humidityMean: AmedasApp.meanOf(st2.humidities),
         windVectorSpeed: vec.speed, windVectorDir: vec.dirDeg,
         windRms: AmedasApp.rmsOf(st2.windSpeeds),
-        precipitation24h: st2.precipitation24h
+        precipitation: st2.precipitation
       });
     }
     return out;
@@ -639,7 +826,7 @@ function initApp(){
 
   function computePrefStats(stationSeries){
     return {
-      precipitation: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.precipitation24h; })) },
+      precipitation: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.precipitation; })) },
       temperature: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.tempMean; })) },
       humidity: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.humidityMean; })) },
       windVector: AmedasApp.vectorWindAverage(stationSeries.map(function(s){ return { speed: s.windVectorSpeed, dirDeg: s.windVectorDir }; })),
@@ -652,8 +839,9 @@ function initApp(){
     return v.toFixed(digits === undefined ? 1 : digits);
   }
 
-  function renderSummary(prefStats, stationCount){
+  function renderSummary(prefStats, stationCount, intervalLabel, regionLabel){
     var html = "<table>";
+    html += "<tr><td class='k'>統計区間 / 地域</td><td>" + intervalLabel + " ／ " + regionLabel + "</td></tr>";
     html += "<tr><td class='k'>観測点数</td><td>" + stationCount + "</td></tr>";
     html += "<tr><td class='k'>降水量 累計平均</td><td>" + fmt(prefStats.precipitation.mean) + " mm</td></tr>";
     html += "<tr><td class='k'>気温 平均</td><td>" + fmt(prefStats.temperature.mean) + " ℃</td></tr>";
@@ -668,7 +856,7 @@ function initApp(){
   function valuesForItem(stationSeries, item){
     return stationSeries.map(function(s){
       var v;
-      if (item === "precipitation") v = s.precipitation24h;
+      if (item === "precipitation") v = s.precipitation;
       else if (item === "temperature") v = s.tempMean;
       else if (item === "humidity") v = s.humidityMean;
       else if (item === "windSpeed") v = s.windVectorSpeed;
@@ -869,7 +1057,7 @@ function initApp(){
     var item = els.itemSelect.value;
     var meta = ITEM_META[item];
     var v;
-    if (item === "precipitation") v = fmt(best.precipitation24h) + " mm";
+    if (item === "precipitation") v = fmt(best.precipitation) + " mm";
     else if (item === "temperature") v = fmt(best.tempMean) + " ℃";
     else if (item === "humidity") v = fmt(best.humidityMean, 0) + " %";
     else if (item === "windSpeed") v = fmt(best.windVectorSpeed) + " m/s";
@@ -880,27 +1068,92 @@ function initApp(){
     els.tooltip.style.display = "block";
   }
 
+  // 選択中の地域(regionIndex)について、キャッシュ済みのスナップショットから
+  // 統計・グリッド・等高線を再計算して描画する。ネットワーク再取得は行わない
+  // （「地域」プルダウン切り替え時にも即座に反映できるようにするため）。
+  function applyRegion(regionIndex){
+    var regions = cache.regions;
+    if (!regions || !regions[regionIndex] || !cache.snapshots) return;
+    var region = regions[regionIndex];
+    var amedasTable = cache.amedasTable;
+    var snapshots = cache.snapshots;
+    var precipField = cache.precipField;
+
+    // 統計・観測点マーカーは地域内の観測点のみ（隣接県は含めない）
+    var coreStations = selectStationsInGeometry(amedasTable, region.geometry, 0);
+    // ヒートマップ/等高線の補間入力は、県境の外側までなめらかに描くため
+    // 近傍の観測点（隣接都道府県を含む）も加える
+    var extendedStations = selectStationsInGeometry(amedasTable, region.geometry, BORDER_BUFFER_DEG);
+
+    var coreSeries = buildStationSeries(coreStations, snapshots, precipField);
+    var extendedSeries = buildStationSeries(extendedStations, snapshots, precipField);
+
+    var prefStats = computePrefStats(coreSeries);
+    renderSummary(prefStats, coreSeries.length, cache.intervalLabel, region.label);
+
+    var bounds = AmedasApp.geometryBounds(region.geometry);
+    var spanPad = Math.max((bounds.lonMax - bounds.lonMin), (bounds.latMax - bounds.latMin)) * 0.08;
+    var padDeg = Math.max(spanPad, BORDER_BUFFER_DEG * 1.5);
+    bounds = { lonMin: bounds.lonMin - padDeg, lonMax: bounds.lonMax + padDeg,
+               latMin: bounds.latMin - padDeg, latMax: bounds.latMax + padDeg };
+    var projector = AmedasApp.makeProjector(bounds, els.canvas.width || 800, els.canvas.height || 600, 24);
+
+    var grids = {}, contours = {};
+    var items = ["precipitation", "temperature", "humidity", "windSpeed"];
+    for (var ii = 0; ii < items.length; ii++) {
+      var it = items[ii];
+      var pts = valuesForItem(extendedSeries, it);
+      var grid = AmedasApp.idwGrid(pts, bounds, 60, 60, 2);
+      grid = AmedasApp.maskGridByGeometry(grid, region.geometry, BORDER_BUFFER_DEG);
+      grids[it] = grid;
+    }
+
+    lastResult = {
+      stationSeries: coreSeries, boundaryGeometry: region.geometry,
+      projector: projector, grids: grids, contours: contours, heatmapBitmaps: {}
+    };
+    view.zoom = 1; view.panX = 0; view.panY = 0;
+
+    for (var jj = 0; jj < items.length; jj++) {
+      var itj = items[jj];
+      var finiteVals = grids[itj].values.filter(function(v){ return isFinite(v); });
+      var min = finiteVals.length ? Math.min.apply(null, finiteVals) : 0;
+      var max = finiteVals.length ? Math.max.apply(null, finiteVals) : 1;
+      var levels = AmedasApp.linspace(min, max, 7).slice(1, -1);
+      contours[itj] = AmedasApp.marchingSquaresContours(grids[itj], levels);
+
+      var mm = buildHeatmapBitmap(grids[itj], itj);
+      var bmp = document.createElement("canvas");
+      bmp.width = offscreen.width; bmp.height = offscreen.height;
+      bmp.getContext("2d").drawImage(offscreen, 0, 0);
+      lastResult.heatmapBitmaps[itj] = bmp;
+      if (els.itemSelect.value === itj) updateLegend(itj, mm.min, mm.max);
+    }
+    if (els.itemSelect.value === "windDirection") updateLegend("windDirection", 0, 0);
+
+    requestRedraw();
+  }
+
   function runLoad(){
     var interval = document.querySelector('input[name="interval"]:checked').value;
-    if (interval !== "24h") {
-      showNote("気象庁の公開APIは実測データの保持期間が短く（全国スナップショットは約1日分、観測点別データも約9〜10日分のみ）、過去1か月・1年の実測統計はこのアプリでは取得できません。過去24時間を選択してください。", "info");
-      lastResult = null; requestRedraw();
-      els.summaryPanel.textContent = "過去1か月・1年は実測データ取得不可のため未対応です。";
-      return;
-    }
+    var intervalMeta = INTERVAL_META[interval];
     clearNote();
     els.loadBtn.disabled = true;
+    els.regionSelect.disabled = true;
     var prefName = els.prefSelect.value;
-    log("=== " + prefName + " の取得を開始 ===");
+    log("=== " + prefName + "（" + intervalMeta.label + "）の取得を開始 ===");
 
     Promise.all([ensureAmedasTable(), ensureGeoJson()]).then(function(res){
       var amedasTable = res[0], geojson = res[1];
       var feature = findPrefFeature(geojson, prefName);
       if (!feature) throw new Error("GeoJSONに一致する都道府県が見つかりません: " + prefName);
 
-      var stations = selectStationsInPrefecture(amedasTable, feature.geometry);
-      log(prefName + " 内のアメダス観測点: " + stations.length + " 地点");
-      if (stations.length === 0) throw new Error("対象都道府県内に観測点が見つかりませんでした");
+      var regions = buildRegions(amedasTable, feature.geometry);
+      if (regions.length === 0) throw new Error("対象都道府県内に観測点が見つかりませんでした");
+      var totalStations = regions.reduce(function(s, r){ return s + r.stationCount; }, 0);
+      log(prefName + " 内のアメダス観測点: 合計 " + totalStations + " 地点（" + regions.length + "地域）");
+      cache.regions = regions;
+      populateRegionSelect(regions);
 
       return fetch(LATEST_TIME_URL).then(function(res){
         if (!res.ok) throw new Error("最新観測時刻の取得に失敗しました: HTTP " + res.status);
@@ -908,59 +1161,20 @@ function initApp(){
       }).then(function(latestIsoText){
         var latestIso = latestIsoText.trim();
         log("最新観測時刻: " + latestIso);
-        var timestamps = AmedasApp.buildHourlyTimestamps(latestIso, 24);
-        var progressCount = 0;
+        var timestamps = AmedasApp.buildTimestamps(latestIso, intervalMeta.count, intervalMeta.stepMinutes);
         return fetchWithPool(timestamps, fetchMapSnapshot, 4, function(done, total){
-          progressCount = done;
           if (done % 4 === 0 || done === total) log("観測データ取得中... " + done + "/" + total);
         }).then(function(snapshots){
           var okCount = snapshots.filter(function(s){ return s !== null; }).length;
           log("スナップショット取得完了: " + okCount + "/" + timestamps.length + " 件成功", okCount > 0 ? "ok" : "err");
           if (okCount === 0) throw new Error("観測データを1件も取得できませんでした");
 
-          var stationSeries = buildStationSeries(stations, snapshots);
-          var prefStats = computePrefStats(stationSeries);
-          renderSummary(prefStats, stationSeries.length);
+          cache.snapshots = snapshots;
+          cache.precipField = intervalMeta.precipField;
+          cache.intervalLabel = intervalMeta.label;
 
-          var bounds = AmedasApp.geometryBounds(feature.geometry);
-          var padDeg = Math.max((bounds.lonMax - bounds.lonMin), (bounds.latMax - bounds.latMin)) * 0.08;
-          bounds = { lonMin: bounds.lonMin - padDeg, lonMax: bounds.lonMax + padDeg,
-                     latMin: bounds.latMin - padDeg, latMax: bounds.latMax + padDeg };
-          var projector = AmedasApp.makeProjector(bounds, els.canvas.width || 800, els.canvas.height || 600, 24);
-
-          var grids = {}, contours = {}, heatmapBitmaps = {};
-          var items = ["precipitation", "temperature", "humidity", "windSpeed"];
-          for (var ii = 0; ii < items.length; ii++) {
-            var it = items[ii];
-            var pts = valuesForItem(stationSeries, it);
-            var grid = AmedasApp.idwGrid(pts, bounds, 60, 60, 2);
-            grid = AmedasApp.maskGridByGeometry(grid, feature.geometry);
-            grids[it] = grid;
-            var finiteVals = grid.values.filter(function(v){ return isFinite(v); });
-            var min = finiteVals.length ? Math.min.apply(null, finiteVals) : 0;
-            var max = finiteVals.length ? Math.max.apply(null, finiteVals) : 1;
-            var levels = AmedasApp.linspace(min, max, 7).slice(1, -1);
-            contours[it] = AmedasApp.marchingSquaresContours(grid, levels);
-          }
-
-          lastResult = {
-            stationSeries: stationSeries, boundaryGeometry: feature.geometry,
-            projector: projector, grids: grids, contours: contours, heatmapBitmaps: {}
-          };
-          view.zoom = 1; view.panX = 0; view.panY = 0;
-
-          for (var jj = 0; jj < items.length; jj++) {
-            var itj = items[jj];
-            var mm = buildHeatmapBitmap(grids[itj], itj);
-            var bmp = document.createElement("canvas");
-            bmp.width = offscreen.width; bmp.height = offscreen.height;
-            bmp.getContext("2d").drawImage(offscreen, 0, 0);
-            lastResult.heatmapBitmaps[itj] = bmp;
-            if (els.itemSelect.value === itj) updateLegend(itj, mm.min, mm.max);
-          }
-          if (els.itemSelect.value === "windDirection") updateLegend("windDirection", 0, 0);
-
-          requestRedraw();
+          applyRegion(0);
+          els.regionSelect.disabled = regions.length <= 1;
           log("描画完了", "ok");
         });
       });
@@ -989,6 +1203,9 @@ function initApp(){
   populatePrefectures();
   attachInteraction();
   els.loadBtn.addEventListener("click", runLoad);
+  els.regionSelect.addEventListener("change", function(){
+    applyRegion(parseInt(els.regionSelect.value, 10));
+  });
   els.itemSelect.addEventListener("change", onItemOrLayerChange);
   els.layerHeatmap.addEventListener("change", requestRedraw);
   els.layerContour.addEventListener("change", requestRedraw);

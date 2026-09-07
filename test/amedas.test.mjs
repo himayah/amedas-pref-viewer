@@ -143,6 +143,15 @@ test("maskGridByGeometry: ジオメトリ外のセルをNaNにする", () => {
   assert.ok(Number.isNaN(masked.values[0]));
 });
 
+test("maskGridByGeometry: bufferDegを指定すると境界の外側のセルも残す", () => {
+  const bounds = { lonMin: 0, lonMax: 2, latMin: 0, latMax: 2 };
+  const grid = A.idwGrid([{ lon: 1, lat: 1, value: 42 }], bounds, 2, 2, 2);
+  const smallSquare = { type: "Polygon", coordinates: [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]] };
+  // 右上セル(2,2)は境界(1,1)から約1.41度離れている -> buffer 2.0なら残る
+  const masked = A.maskGridByGeometry(grid, smallSquare, 2.0);
+  assert.ok(!Number.isNaN(masked.values[0]));
+});
+
 test("marchingSquaresContours: 単純な勾配グリッドで等高線セグメントが得られる", () => {
   // 2x2グリッド、左から右へ0->10の勾配
   const grid = { values: [0, 10, 0, 10], cols: 2, rows: 2, bounds: { lonMin: 0, lonMax: 1, latMin: 0, latMax: 1 } };
@@ -171,10 +180,77 @@ test("formatJstTimestamp: UTC日時をJSTのYYYYMMDDHHMMSSに変換する", () =
   assert.equal(A.formatJstTimestamp(d), "20260101090000");
 });
 
-test("buildHourlyTimestamps: 最新時刻から1時間刻みで指定件数を新しい順に生成する", () => {
-  const ts = A.buildHourlyTimestamps("2026-01-01T12:00:00+09:00", 3);
+test("buildTimestamps: 最新時刻から1時間刻みで指定件数を新しい順に生成する", () => {
+  const ts = A.buildTimestamps("2026-01-01T12:00:00+09:00", 3, 60);
   assert.equal(ts.length, 3);
   assert.equal(ts[0], "20260101120000");
   assert.equal(ts[1], "20260101110000");
   assert.equal(ts[2], "20260101100000");
+});
+
+test("buildTimestamps: 10分刻みでも正しく生成する（過去1時間=6点相当）", () => {
+  const ts = A.buildTimestamps("2026-01-01T12:00:00+09:00", 6, 10);
+  assert.equal(ts.length, 6);
+  assert.equal(ts[0], "20260101120000");
+  assert.equal(ts[5], "20260101111000"); // 12:00 - 5*10分 = 11:10
+});
+
+test("polygonBounds: 単一ポリゴンの外接矩形を計算する", () => {
+  const b = A.polygonBounds([[[0, 0], [10, 0], [10, 5], [0, 5], [0, 0]]]);
+  assert.equal(b.lonMin, 0);
+  assert.equal(b.lonMax, 10);
+  assert.equal(b.latMin, 0);
+  assert.equal(b.latMax, 5);
+});
+
+test("bboxGapDistance: 重なる矩形は0、離れた矩形は隙間の距離を返す", () => {
+  const a = { lonMin: 0, lonMax: 10, latMin: 0, latMax: 10 };
+  const b = { lonMin: 5, lonMax: 15, latMin: 5, latMax: 15 };
+  assert.equal(A.bboxGapDistance(a, b), 0); // 重なっている
+
+  const c = { lonMin: 20, lonMax: 25, latMin: 0, latMax: 10 };
+  assert.equal(A.bboxGapDistance(a, c), 10); // lonの隙間のみ (20-10)
+});
+
+test("clusterPolygons: 近い2つの矩形は同一クラスタ、遠い矩形は別クラスタになる", () => {
+  const near = {
+    type: "MultiPolygon",
+    coordinates: [
+      [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+      [[[1.2, 0], [2.2, 0], [2.2, 1], [1.2, 1], [1.2, 0]]], // 0.2度しか離れていない
+    ],
+  };
+  const nearClusters = A.clusterPolygons(near, 1.0);
+  assert.equal(nearClusters.length, 1);
+
+  const far = {
+    type: "MultiPolygon",
+    coordinates: [
+      [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+      [[[10, 10], [11, 10], [11, 11], [10, 11], [10, 10]]], // 遠く離れた「離島」
+    ],
+  };
+  const farClusters = A.clusterPolygons(far, 1.0);
+  assert.equal(farClusters.length, 2);
+});
+
+test("clusterPolygons: Polygon型ジオメトリは常に単一クラスタになる", () => {
+  const polygon = { type: "Polygon", coordinates: [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]] };
+  const clusters = A.clusterPolygons(polygon, 1.0);
+  assert.equal(clusters.length, 1);
+  assert.equal(clusters[0].geometry.type, "Polygon");
+});
+
+test("distPointToSegmentSq: 点-線分間の最短距離の2乗を計算する", () => {
+  // 水平線分(0,0)-(10,0)の真上(5,3)にある点 -> 距離3
+  assert.ok(Math.abs(A.distPointToSegmentSq(5, 3, 0, 0, 10, 0) - 9) < 1e-9);
+  // 線分の延長線上（端点より外側）は端点までの距離
+  assert.ok(Math.abs(A.distPointToSegmentSq(-4, 0, 0, 0, 10, 0) - 16) < 1e-9);
+});
+
+test("pointNearGeometry: ジオメトリ内部は常にtrue、境界付近はバッファ距離内でtrue", () => {
+  const square = { type: "Polygon", coordinates: [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]] };
+  assert.equal(A.pointNearGeometry(5, 5, square, 0.1), true);   // 内部
+  assert.equal(A.pointNearGeometry(10.05, 5, square, 0.1), true);  // 境界から0.05外
+  assert.equal(A.pointNearGeometry(11, 5, square, 0.1), false); // 境界から1外（バッファ超え）
 });
