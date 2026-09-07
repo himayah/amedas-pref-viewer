@@ -990,9 +990,15 @@ function initApp(){
       }
     }
 
-    // boundary（ヒートマップ等の塗りつぶしに隠れないよう、常に最前面に描画する）
+    // boundary（ヒートマップ等の塗りつぶしに隠れないよう、常に最前面に描画する）。
+    // ヒートマップは赤〜緑〜青の幅広い色域を取るため、単色の線だと必ずどこかで
+    // 背景色に埋もれてしまう。暗色の縁取り（ハロー）を太めに描いてから、その上に
+    // 明るい線を重ねる2パス描画にすることで、どんな背景色でもコントラストを確保する。
     if (els.layerBoundary.checked) {
-      ctx.strokeStyle = "#7fb7ff"; ctx.lineWidth = 1.5;
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = "rgba(0,0,0,0.85)"; ctx.lineWidth = 3.5;
+      drawGeometry(lastResult.boundaryGeometry, projector);
+      ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1.4;
       drawGeometry(lastResult.boundaryGeometry, projector);
     }
   }
