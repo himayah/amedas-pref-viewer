@@ -58,7 +58,7 @@
 <body>
 <header>
   <h1>アメダス都道府県統計ビューア</h1>
-  <p>気象庁アメダス公開データ（過去24時間・実測）／降水量・気温・湿度・風の統計を地図に可視化</p>
+  <p>気象庁アメダス公開データ（過去1時間・過去24時間・実測）／降水量・気温・湿度・風・気圧・日照時間・視程の統計を地図に可視化</p>
 </header>
 <div class="app">
   <aside class="controls">
@@ -90,11 +90,16 @@
         <option value="humidity">湿度（平均, %）</option>
         <option value="windSpeed">風速（合成ベクトル平均, m/s）</option>
         <option value="windDirection">風向（合成ベクトル平均）</option>
+        <option value="pressure">気圧（海面更正・平均, hPa）</option>
+        <option value="sunshine">日照時間（累計, 分）</option>
+        <option value="visibility">視程（平均, km）</option>
       </select>
       <div class="checkRow"><input type="checkbox" id="layerHeatmap" checked><label for="layerHeatmap">ヒートマップ</label></div>
       <div class="checkRow"><input type="checkbox" id="layerContour" checked><label for="layerContour">等高線</label></div>
       <div class="checkRow"><input type="checkbox" id="layerPoints" checked><label for="layerPoints">観測点</label></div>
+      <div class="checkRow"><input type="checkbox" id="layerWindVector" checked><label for="layerWindVector">風ベクトル（矢印, 最新観測）</label></div>
       <div class="checkRow"><input type="checkbox" id="layerBoundary" checked><label for="layerBoundary">都道府県境界</label></div>
+      <div class="hint">風ベクトルは、区間平均ではなく最新観測時刻1点の実測風向・風速を矢印で表示します（観測点になければ非表示）。</div>
       <button id="resetViewBtn" type="button" class="secondary">表示リセット（拡大縮小/移動）</button>
     </fieldset>
 
@@ -147,14 +152,20 @@ var ITEM_META = {
   temperature:   { label:"気温",   unit:"℃" },
   humidity:      { label:"湿度",   unit:"%" },
   windSpeed:     { label:"風速",   unit:"m/s" },
-  windDirection: { label:"風向",   unit:"" }
+  windDirection: { label:"風向",   unit:"" },
+  pressure:      { label:"気圧（海面更正）", unit:"hPa" },
+  sunshine:      { label:"日照時間", unit:"分" },
+  visibility:    { label:"視程",   unit:"km" }
 };
 
 // 統計区間ごとのメタ情報。JMAスナップショットは10分間隔で提供されるため、
 // 「過去1時間」は10分刻み6点、「過去24時間」は1時間刻み24点を実測値から算出する。
+// sunField/sunMode: 日照時間の集計方法。JMAは降水量と異なり「過去24時間累計」の
+// 既製フィールドを提供しないため、sun1h（直近1時間のローリング累計, 分）を
+// 区間に応じて「最新1点をそのまま採用」または「1時間間隔で24点合算」する。
 var INTERVAL_META = {
-  "1h":  { label:"過去1時間",  count:6,  stepMinutes:10, precipField:"precipitation1h" },
-  "24h": { label:"過去24時間", count:24, stepMinutes:60, precipField:"precipitation24h" }
+  "1h":  { label:"過去1時間",  count:6,  stepMinutes:10, precipField:"precipitation1h",  sunField:"sun1h", sunMode:"latest" },
+  "24h": { label:"過去24時間", count:24, stepMinutes:60, precipField:"precipitation24h", sunField:"sun1h", sunMode:"sum" }
 };
 
 // 同一都道府県内でも本土から大きく離れた離島（例：小笠原諸島）は、
@@ -623,6 +634,7 @@ function initApp(){
     layerHeatmap: document.getElementById("layerHeatmap"),
     layerContour: document.getElementById("layerContour"),
     layerPoints: document.getElementById("layerPoints"),
+    layerWindVector: document.getElementById("layerWindVector"),
     layerBoundary: document.getElementById("layerBoundary"),
     regionSelect: document.getElementById("regionSelect"),
     regionHint: document.getElementById("regionHint")
@@ -634,7 +646,7 @@ function initApp(){
 
   var cache = {
     amedasTable: null, geojson: null, features: {},
-    regions: null, snapshots: null, precipField: null, intervalLabel: ""
+    regions: null, snapshots: null, precipField: null, sunMeta: null, intervalLabel: ""
   };
   var view = { zoom: 1, panX: 0, panY: 0, dragging: false, dragStartX: 0, dragStartY: 0, panStartX: 0, panStartY: 0 };
   var lastResult = null; // { stations, boundaryGeometry, bounds }
@@ -794,12 +806,15 @@ function initApp(){
 
   // precipField: "precipitation1h" | "precipitation24h"（統計区間に応じてJMAスナップショットの
   // どの累計降水量フィールドを採用するかを切り替える）
-  function buildStationSeries(stations, snapshots, precipField){
+  // sunMeta: { field:"sun1h", mode:"latest"|"sum" }（区間に応じた日照時間の集計方法。§追加要件3）
+  function buildStationSeries(stations, snapshots, precipField, sunMeta){
     var byCode = {};
     for (var i = 0; i < stations.length; i++) {
       byCode[stations[i].code] = {
         code: stations[i].code, name: stations[i].name, lat: stations[i].lat, lon: stations[i].lon,
-        temps: [], humidities: [], windPairs: [], windSpeeds: [], precipitation: null
+        temps: [], humidities: [], windPairs: [], windSpeeds: [], pressures: [], visibilities: [],
+        precipitation: null, sunSum: 0, sunCount: 0, sunLatest: null,
+        windLatestSpeed: null, windLatestDir: null, windLatestFound: false
       };
     }
     // snapshots: most-recent-first
@@ -812,14 +827,31 @@ function initApp(){
         var st = byCode[code];
         if (rec.temp && typeof rec.temp[0] === "number" && rec.temp[1] === 0) st.temps.push(rec.temp[0]);
         if (rec.humidity && typeof rec.humidity[0] === "number" && rec.humidity[1] === 0) st.humidities.push(rec.humidity[0]);
+        // 気圧：海面更正気圧（normalPressure）を優先し、無い場合のみ現地気圧（pressure）で代替する
+        // （標高差のある観測点間でも地図上で比較可能な値にするため）。特別地域気象観測所のみ提供。
+        var pressureRec = (rec.normalPressure && typeof rec.normalPressure[0] === "number" && rec.normalPressure[1] === 0)
+          ? rec.normalPressure
+          : ((rec.pressure && typeof rec.pressure[0] === "number" && rec.pressure[1] === 0) ? rec.pressure : null);
+        if (pressureRec) st.pressures.push(pressureRec[0]);
+        if (rec.visibility && typeof rec.visibility[0] === "number" && rec.visibility[1] === 0) st.visibilities.push(rec.visibility[0]);
         if (rec.wind && typeof rec.wind[0] === "number" && rec.wind[1] === 0) {
           st.windSpeeds.push(rec.wind[0]);
           var dirDeg = (rec.windDirection && rec.windDirection[1] === 0) ? AmedasApp.windDirCodeToDeg(rec.windDirection[0]) : null;
           st.windPairs.push({ speed: rec.wind[0], dirDeg: dirDeg });
+          // 区間平均ベクトルとは別に、最新観測時刻（s昇順で最初に見つかる有効値）の実測風向風速も保持する
+          // （地図上に「今の風」を矢印で表示するため。追加要件3）。
+          if (!st.windLatestFound && dirDeg !== null) {
+            st.windLatestSpeed = rec.wind[0]; st.windLatestDir = dirDeg; st.windLatestFound = true;
+          }
         }
         var precipRec = rec[precipField];
         if (s === 0 && precipRec && typeof precipRec[0] === "number" && precipRec[1] === 0) {
           st.precipitation = precipRec[0];
+        }
+        var sunRec = sunMeta ? rec[sunMeta.field] : null;
+        if (sunRec && typeof sunRec[0] === "number" && sunRec[1] === 0) {
+          if (sunMeta.mode === "sum") { st.sunSum += sunRec[0]; st.sunCount++; }
+          else if (s === 0) { st.sunLatest = sunRec[0]; }
         }
       }
     }
@@ -827,13 +859,19 @@ function initApp(){
     for (var c in byCode) {
       var st2 = byCode[c];
       var vec = AmedasApp.vectorWindAverage(st2.windPairs);
+      var visRaw = AmedasApp.meanOf(st2.visibilities);
       out.push({
         code: st2.code, name: st2.name, lat: st2.lat, lon: st2.lon,
         tempMean: AmedasApp.meanOf(st2.temps),
         humidityMean: AmedasApp.meanOf(st2.humidities),
         windVectorSpeed: vec.speed, windVectorDir: vec.dirDeg,
         windRms: AmedasApp.rmsOf(st2.windSpeeds),
-        precipitation: st2.precipitation
+        windScalarMean: AmedasApp.meanOf(st2.windSpeeds),
+        windLatestSpeed: st2.windLatestSpeed, windLatestDir: st2.windLatestDir,
+        precipitation: st2.precipitation,
+        pressureMean: AmedasApp.meanOf(st2.pressures),
+        sunshine: sunMeta && sunMeta.mode === "sum" ? (st2.sunCount > 0 ? st2.sunSum : null) : st2.sunLatest,
+        visibilityMean: visRaw === null ? null : visRaw / 1000
       });
     }
     return out;
@@ -845,7 +883,11 @@ function initApp(){
       temperature: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.tempMean; })) },
       humidity: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.humidityMean; })) },
       windVector: AmedasApp.vectorWindAverage(stationSeries.map(function(s){ return { speed: s.windVectorSpeed, dirDeg: s.windVectorDir }; })),
-      windRms: { speed: AmedasApp.rmsOf(stationSeries.map(function(s){ return s.windRms; })) }
+      windRms: { speed: AmedasApp.rmsOf(stationSeries.map(function(s){ return s.windRms; })) },
+      windScalar: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.windScalarMean; })) },
+      pressure: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.pressureMean; })) },
+      sunshine: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.sunshine; })) },
+      visibility: { mean: AmedasApp.meanOf(stationSeries.map(function(s){ return s.visibilityMean; })) }
     };
   }
 
@@ -863,7 +905,11 @@ function initApp(){
     html += "<tr><td class='k'>湿度 平均</td><td>" + fmt(prefStats.humidity.mean, 0) + " %</td></tr>";
     html += "<tr><td class='k'>風 合成ベクトル平均</td><td>" + fmt(prefStats.windVector.speed) + " m/s ／ " +
       AmedasApp.degToCompass16(prefStats.windVector.dirDeg) + " (" + fmt(prefStats.windVector.dirDeg, 0) + "°)</td></tr>";
+    html += "<tr><td class='k'>風速 絶対値平均</td><td>" + fmt(prefStats.windScalar.mean) + " m/s</td></tr>";
     html += "<tr><td class='k'>風速 RMS</td><td>" + fmt(prefStats.windRms.speed) + " m/s</td></tr>";
+    html += "<tr><td class='k'>気圧（海面更正）平均</td><td>" + fmt(prefStats.pressure.mean, 1) + " hPa</td></tr>";
+    html += "<tr><td class='k'>日照時間 累計平均</td><td>" + fmt(prefStats.sunshine.mean, 0) + " 分</td></tr>";
+    html += "<tr><td class='k'>視程 平均</td><td>" + fmt(prefStats.visibility.mean, 1) + " km</td></tr>";
     html += "</table>";
     els.summaryPanel.innerHTML = html;
   }
@@ -875,6 +921,9 @@ function initApp(){
       else if (item === "temperature") v = s.tempMean;
       else if (item === "humidity") v = s.humidityMean;
       else if (item === "windSpeed") v = s.windVectorSpeed;
+      else if (item === "pressure") v = s.pressureMean;
+      else if (item === "sunshine") v = s.sunshine;
+      else if (item === "visibility") v = s.visibilityMean;
       else v = s.windVectorDir;
       return { lon: s.lon, lat: s.lat, value: v, name: s.name };
     });
@@ -970,7 +1019,7 @@ function initApp(){
       }
     }
 
-    // points / wind arrows
+    // points
     if (els.layerPoints.checked) {
       for (var i = 0; i < lastResult.stationSeries.length; i++) {
         var st = lastResult.stationSeries[i];
@@ -978,15 +1027,29 @@ function initApp(){
         ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, Math.PI * 2);
         ctx.fillStyle = "#ffffff"; ctx.fill();
         ctx.strokeStyle = "#0a1220"; ctx.lineWidth = 1; ctx.stroke();
+      }
+    }
 
-        if (item === "windDirection" && st.windVectorDir !== null && st.windVectorSpeed !== null) {
-          var rad = (st.windVectorDir + 180) * Math.PI / 180; // arrow points where wind blows TO
-          var len = 10 + Math.min(st.windVectorSpeed, 15) * 2;
-          var ex = p[0] + Math.sin(rad) * len;
-          var ey = p[1] - Math.cos(rad) * len;
-          ctx.strokeStyle = "#ffcf5c"; ctx.lineWidth = 1.5;
-          ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(ex, ey); ctx.stroke();
-        }
+    // 風ベクトル（矢印）: 区間平均ではなく、観測点ごとの最新観測時刻1点の実測風向風速を用いる
+    // （「今の風」を示すため。区間平均は上の統計サマリー／windSpeed・windDirection項目側で扱う）。
+    if (els.layerWindVector.checked) {
+      for (var wi = 0; wi < lastResult.stationSeries.length; wi++) {
+        var wst = lastResult.stationSeries[wi];
+        if (wst.windLatestDir === null || wst.windLatestSpeed === null) continue;
+        var wp = screenXY(projector, wst.lon, wst.lat);
+        var wrad = (wst.windLatestDir + 180) * Math.PI / 180; // arrow points where wind blows TO
+        var wlen = 10 + Math.min(wst.windLatestSpeed, 15) * 2;
+        var wex = wp[0] + Math.sin(wrad) * wlen;
+        var wey = wp[1] - Math.cos(wrad) * wlen;
+        ctx.strokeStyle = "#ffcf5c"; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(wp[0], wp[1]); ctx.lineTo(wex, wey); ctx.stroke();
+        var headLen = 5, headAngle = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(wex, wey);
+        ctx.lineTo(wex - headLen * Math.sin(wrad - headAngle), wey + headLen * Math.cos(wrad - headAngle));
+        ctx.moveTo(wex, wey);
+        ctx.lineTo(wex - headLen * Math.sin(wrad + headAngle), wey + headLen * Math.cos(wrad + headAngle));
+        ctx.stroke();
       }
     }
 
@@ -1081,8 +1144,14 @@ function initApp(){
     if (item === "precipitation") v = fmt(best.precipitation) + " mm";
     else if (item === "temperature") v = fmt(best.tempMean) + " ℃";
     else if (item === "humidity") v = fmt(best.humidityMean, 0) + " %";
-    else if (item === "windSpeed") v = fmt(best.windVectorSpeed) + " m/s";
+    else if (item === "windSpeed") v = fmt(best.windVectorSpeed) + " m/s（絶対値平均 " + fmt(best.windScalarMean) + " m/s）";
+    else if (item === "pressure") v = fmt(best.pressureMean, 1) + " hPa";
+    else if (item === "sunshine") v = fmt(best.sunshine, 0) + " 分";
+    else if (item === "visibility") v = fmt(best.visibilityMean, 1) + " km";
     else v = AmedasApp.degToCompass16(best.windVectorDir) + " / " + fmt(best.windVectorDir, 0) + "° (" + fmt(best.windVectorSpeed) + " m/s)";
+    if (best.windLatestDir !== null && best.windLatestSpeed !== null) {
+      v += "／最新の風: " + AmedasApp.degToCompass16(best.windLatestDir) + " " + fmt(best.windLatestSpeed) + " m/s";
+    }
     els.tooltip.textContent = best.name + "：" + v;
     els.tooltip.style.left = (mx + 14) + "px";
     els.tooltip.style.top = (my + 10) + "px";
@@ -1099,6 +1168,7 @@ function initApp(){
     var amedasTable = cache.amedasTable;
     var snapshots = cache.snapshots;
     var precipField = cache.precipField;
+    var sunMeta = cache.sunMeta;
 
     // 統計・観測点マーカーは地域内の観測点のみ（隣接県は含めない）
     var coreStations = selectStationsInGeometry(amedasTable, region.geometry, 0);
@@ -1106,8 +1176,8 @@ function initApp(){
     // 近傍の観測点（隣接都道府県を含む）も加える
     var extendedStations = selectStationsInGeometry(amedasTable, region.geometry, BORDER_BUFFER_DEG);
 
-    var coreSeries = buildStationSeries(coreStations, snapshots, precipField);
-    var extendedSeries = buildStationSeries(extendedStations, snapshots, precipField);
+    var coreSeries = buildStationSeries(coreStations, snapshots, precipField, sunMeta);
+    var extendedSeries = buildStationSeries(extendedStations, snapshots, precipField, sunMeta);
 
     var prefStats = computePrefStats(coreSeries);
     renderSummary(prefStats, coreSeries.length, cache.intervalLabel, region.label);
@@ -1120,7 +1190,7 @@ function initApp(){
     var projector = AmedasApp.makeProjector(bounds, els.canvas.width || 800, els.canvas.height || 600, 24);
 
     var grids = {}, contours = {};
-    var items = ["precipitation", "temperature", "humidity", "windSpeed"];
+    var items = ["precipitation", "temperature", "humidity", "windSpeed", "pressure", "sunshine", "visibility"];
     for (var ii = 0; ii < items.length; ii++) {
       var it = items[ii];
       var pts = valuesForItem(extendedSeries, it);
@@ -1192,6 +1262,7 @@ function initApp(){
 
           cache.snapshots = snapshots;
           cache.precipField = intervalMeta.precipField;
+          cache.sunMeta = { field: intervalMeta.sunField, mode: intervalMeta.sunMode };
           cache.intervalLabel = intervalMeta.label;
 
           applyRegion(0);
@@ -1231,6 +1302,7 @@ function initApp(){
   els.layerHeatmap.addEventListener("change", requestRedraw);
   els.layerContour.addEventListener("change", requestRedraw);
   els.layerPoints.addEventListener("change", requestRedraw);
+  els.layerWindVector.addEventListener("change", requestRedraw);
   els.layerBoundary.addEventListener("change", requestRedraw);
   window.addEventListener("resize", requestRedraw);
 
